@@ -54,4 +54,10 @@ module.exports = {
 
   // Error monitoring (optional — no-op if unset)
   SENTRY_DSN:             process.env.SENTRY_DSN || '',
+
+  // Ooredoo Credentials
+
+  AHLA_PHONE_NUMBER:      process.env.AHLA_PHONE_NUMBER,
+  AHLA_PASSWORD:          process.env.AHLA_PASSWORD,
+  AHLA_CODE_PIN:          process.env.AHLA_CODE_PIN,
 };

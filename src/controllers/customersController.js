@@ -66,7 +66,7 @@ const stats = async (client, customerId, lifetimePoints = 0, settings = {}) => {
 
 const lookupByPhone = asyncHandler(async (req, res) => {
   if (!req.query.phone) throw AppError.badRequest('phone is required.', 'VALIDATION_ERROR');
-  const { rows } = await db.query(`SELECT id, phone_number, first_name, last_name, address, profession, notes, created_at, available_points, lifetime_points FROM customers WHERE phone_number = $1`, [normalisePhone(req.query.phone)]);
+  const { rows } = await db.query(`SELECT id, phone_number, first_name, last_name, address, profession, notes, created_at, available_points, lifetime_points, is_pop, pop_cycle FROM customers WHERE phone_number = $1`, [normalisePhone(req.query.phone)]);
   if (!rows[0]) return sendSuccess(res, null);
   const settings = await getLoyaltySettings(db);
   const s = await stats(db, rows[0].id, parseFloat(rows[0].lifetime_points) || 0, settings);
@@ -97,7 +97,7 @@ const listCustomers = asyncHandler(async (req, res) => {
 
   // Added c.created_by to the SELECT query here
   const { rows } = await db.query(
-    `SELECT c.id, c.phone_number, c.first_name, c.last_name, c.address, c.profession, c.notes, c.created_by, c.created_at, c.updated_at, c.available_points, c.lifetime_points,
+    `SELECT c.id, c.phone_number, c.first_name, c.last_name, c.address, c.profession, c.notes, c.created_by, c.created_at, c.updated_at, c.available_points, c.lifetime_points, c.is_pop, c.pop_cycle,
        COALESCE(sim_stats.sim_count, 0) AS sim_count, 
        (COALESCE(sim_stats.sim_base, 0) - (COALESCE(sim_stats.sim_pts, 0) * ${ptVal})) AS sim_total, 
        sim_stats.purchased_offers,
@@ -111,7 +111,7 @@ const listCustomers = asyncHandler(async (req, res) => {
      LEFT JOIN LATERAL (SELECT COUNT(*) FILTER (WHERE is_voided = FALSE) AS sim_count, COALESCE(SUM(selling_price_snapshot) FILTER (WHERE is_voided = FALSE), 0) AS sim_base, COALESCE(SUM(loyalty_redeemed_snapshot) FILTER (WHERE is_voided = FALSE), 0) AS sim_pts, MAX(sold_at) AS sim_last, array_agg(DISTINCT offer_id) FILTER (WHERE is_voided = FALSE) AS purchased_offers FROM session_sim_sales WHERE customer_id = c.id ${dSim}) sim_stats ON TRUE
      LEFT JOIN LATERAL (SELECT COUNT(*) FILTER (WHERE is_voided = FALSE) AS storm_count, COALESCE(SUM(amount) FILTER (WHERE is_voided = FALSE), 0) AS storm_base, COALESCE(SUM(loyalty_redeemed_snapshot) FILTER (WHERE is_voided = FALSE), 0) AS storm_pts, MAX(entered_at) AS storm_last FROM session_storm_entries WHERE customer_id = c.id ${dStorm}) storm_stats ON TRUE
      LEFT JOIN LATERAL (SELECT COUNT(*) FILTER (WHERE is_voided = FALSE) AS acc_count, COALESCE(SUM(price_snapshot) FILTER (WHERE is_voided = FALSE), 0) AS acc_base, COALESCE(SUM(price_snapshot - real_price_snapshot) FILTER (WHERE is_voided = FALSE), 0) AS acc_profit, COALESCE(SUM(loyalty_redeemed_snapshot) FILTER (WHERE is_voided = FALSE), 0) AS acc_pts, MAX(sold_at) AS acc_last FROM session_accessory_sales WHERE customer_id = c.id ${dAcc}) acc_stats ON TRUE
-     ${where} ORDER BY storm_total DESC, c.last_name, c.first_name LIMIT $${params.length - 1} OFFSET $${params.length}`, params
+     ${where} ${req.query.sort === 'name' ? 'ORDER BY c.last_name, c.first_name, c.id' : 'ORDER BY storm_total DESC, c.last_name, c.first_name'} LIMIT $${params.length - 1} OFFSET $${params.length}`, params
   );
 
   sendSuccess(res, rows.map((r) => {
@@ -121,14 +121,14 @@ const listCustomers = asyncHandler(async (req, res) => {
     return {
       ...r, sim_count, available_points: parseFloat(r.available_points) || 0, lifetime_points: lifetime,
       purchased_offers: Array.isArray(r.purchased_offers) ? r.purchased_offers : [],
-      storm_total: parseFloat(r.storm_total), accessory_profit: parseFloat(r.accessory_profit), total_spent,
+      storm_total: parseFloat(r.storm_total), accessory_profit: req.user.role === 'admin' ? parseFloat(r.accessory_profit) : undefined, total_spent,
       tier: assignTier(lifetime, settings), reward: determineReward(sim_count)
     };
   }));
 });
 
 const getCustomer = asyncHandler(async (req, res) => {
-  const { rows } = await db.query(`SELECT id, phone_number, first_name, last_name, address, profession, notes, created_at, updated_at, available_points, lifetime_points FROM customers WHERE id = $1`, [parseId(req.params.id)]);
+  const { rows } = await db.query(`SELECT id, phone_number, first_name, last_name, address, profession, notes, created_at, updated_at, available_points, lifetime_points, is_pop, pop_cycle FROM customers WHERE id = $1`, [parseId(req.params.id)]);
   if (!rows[0]) throw AppError.notFound('Customer not found.');
   const settings = await getLoyaltySettings(db);
   const customerStats = await stats(db, rows[0].id, parseFloat(rows[0].lifetime_points) || 0, settings);
@@ -199,6 +199,17 @@ const updateCustomer = asyncHandler(async (req, res) => {
   if (req.body.address !== undefined) updates.address = parseString(req.body.address, 'address', 500);
   if (req.body.profession !== undefined) updates.profession = parseString(req.body.profession, 'profession', 100);
   if (req.body.notes !== undefined) updates.notes = req.body.notes ? parseString(req.body.notes, 'notes', 1000) : null;
+  if (req.body.is_pop !== undefined) {
+    updates.is_pop = req.body.is_pop === true || req.body.is_pop === 'true';
+    updates.pop_marked_at = updates.is_pop ? new Date() : null;
+  }
+  if (req.body.pop_cycle !== undefined) {
+  const cyc = req.body.pop_cycle === null ? null : parseInt(req.body.pop_cycle, 10);
+  if (cyc !== null && ![1, 8, 15, 22].includes(cyc)) {
+    throw AppError.badRequest('pop_cycle must be 1, 8, 15 or 22.', 'VALIDATION_ERROR');
+  }
+  updates.pop_cycle = cyc;
+}
 
   if (Object.keys(updates).length === 0) throw AppError.badRequest('No updateable fields provided.', 'VALIDATION_ERROR');
 
@@ -239,10 +250,26 @@ const getPopReminders = asyncHandler(async (req, res) => {
   else if (cycleToQuery === 22) { dayFrom = 22; dayTo = 31; }
 
   const { rows } = await db.query(
-    `SELECT DISTINCT ON (c.id) c.id, c.first_name, c.last_name, c.phone_number, c.profession, c.address, s.sold_at, s.offer_name_snapshot, EXTRACT(DAY FROM s.sold_at)::int AS purchase_day, $1::int AS cycle_day
-     FROM session_sim_sales s JOIN customers c ON c.id = s.customer_id
-     WHERE s.is_voided = FALSE AND (s.offer_name_snapshot ILIKE '%pop%' OR s.offer_name_snapshot ILIKE '%ooredoo pop%') AND EXTRACT(DAY FROM s.sold_at) BETWEEN $2 AND $3
-     ORDER BY c.id, s.sold_at DESC`,
+    `SELECT DISTINCT ON (ev.id) ev.id, ev.first_name, ev.last_name, ev.phone_number, ev.profession, ev.address,
+        ev.sold_at, ev.offer_name_snapshot, ev.purchase_day, ev.source, $1::int AS cycle_day
+ FROM (
+   SELECT c.id, c.first_name, c.last_name, c.phone_number, c.profession, c.address,
+          s.sold_at, s.offer_name_snapshot, EXTRACT(DAY FROM s.sold_at)::int AS purchase_day, 'sim' AS source
+   FROM session_sim_sales s JOIN customers c ON c.id = s.customer_id
+   WHERE s.is_voided = FALSE AND (s.offer_name_snapshot ILIKE '%pop%' OR s.offer_name_snapshot ILIKE '%ooredoo pop%')
+     AND EXTRACT(DAY FROM s.sold_at) BETWEEN $2 AND $3
+   UNION ALL
+   SELECT c.id, c.first_name, c.last_name, c.phone_number, c.profession, c.address,
+          e.entered_at AS sold_at, 'POP (Storm)' AS offer_name_snapshot, e.pop_cycle::int AS purchase_day, 'storm' AS source
+   FROM session_storm_entries e JOIN customers c ON c.id = e.customer_id
+   WHERE e.is_voided = FALSE AND e.is_pop_number = TRUE AND e.pop_cycle = $1::int
+     AND NOT EXISTS (
+       SELECT 1 FROM session_storm_entries e2
+        WHERE e2.customer_id = e.customer_id AND e2.is_voided = FALSE
+          AND e2.is_pop_number = TRUE AND e2.entered_at > e.entered_at
+     )
+ ) ev
+ ORDER BY ev.id, ev.sold_at DESC`,
     [cycleToQuery, dayFrom, dayTo]
   );
   sendSuccess(res, { is_reminder_day: targetCycleDay !== null, cycle_due: cycleToQuery, customers: rows });

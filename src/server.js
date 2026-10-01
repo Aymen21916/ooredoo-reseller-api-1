@@ -28,7 +28,7 @@ const expensesRoutes = require('./routes/expensesRoutes');
 const settingsRoutes = require('./routes/settingsRoutes');
 const storeRoutes = require('./routes/storeRoutes');
 const discountRoutes = require('./routes/discountRoutes');
-const { set } = require('fast-check');
+// const { set } = require('fast-check');
 
 const app = express();
 const allowedOrigins = [

@@ -16,12 +16,12 @@ router.use(authenticate);
 router.get('/lookup',  customersController.lookupByPhone);
 router.get('/',        customersController.listCustomers);
 router.post('/',       customersController.createCustomer);
-router.post('/bulk-upload', upload.single('file'), customersController.bulkUpload);
+router.post('/bulk-upload', authorize('admin'), upload.single('file'), customersController.bulkUpload);
 router.get('/pop-reminders', customersController.getPopReminders);
 
 // 2. DYNAMIC ID ROUTES (Must come after static routes!)
 router.get('/:id',     customersController.getCustomer);
-router.patch('/:id',   customersController.updateCustomer);
+router.patch('/:id',   authorize('admin'), customersController.updateCustomer);
 router.delete('/:id',  authorize('admin'), customersController.deleteCustomer);
 router.get('/:id/purchases', customersController.getCustomerPurchases);
 router.get('/:id/loyalty-ledger', customersController.getCustomerLoyaltyLedger);

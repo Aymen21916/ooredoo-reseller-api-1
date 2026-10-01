@@ -75,6 +75,7 @@ const recordSimSale = asyncHandler(async (req, res) => {
   requireFields(req.body, ['session_id', 'offer_id']);
   const sessionId = parseId(req.body.session_id, 'session_id');
   const offerId = parseId(req.body.offer_id, 'offer_id');
+  const appInstalled = req.body.my_ooredoo_app_installed === true || req.body.my_ooredoo_app_installed === 'true';
   const customerId = req.body.customer_id ? parseId(req.body.customer_id, 'customer_id') : null;
   const discountAmount = req.body.discount_amount ? parseFloat(req.body.discount_amount) : 0;
   const requestedPointsToRedeem = req.body.points_redeemed ? parseFloat(req.body.points_redeemed) : 0;
@@ -119,8 +120,8 @@ const recordSimSale = asyncHandler(async (req, res) => {
     const finalPaidCash = baseSellingPrice - discountValue;
     
     const { rows } = await client.query(
-      `INSERT INTO session_sim_sales (session_id, offer_id, customer_id, offer_name_snapshot, real_price_snapshot, selling_price_snapshot, discount_snapshot, commission_points_snapshot, commission_snapshot, loyalty_earned_snapshot, loyalty_redeemed_snapshot) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING *`,
-      [sessionId, offerId, customerId, offer.name, offer.real_price, baseSellingPrice, discountAmount, offer.commission_points, offer.commission_amount, pointsEarned, pointsRedeemed]
+      `INSERT INTO session_sim_sales (session_id, offer_id, customer_id, offer_name_snapshot, real_price_snapshot, selling_price_snapshot, discount_snapshot, commission_points_snapshot, commission_snapshot, loyalty_earned_snapshot, loyalty_redeemed_snapshot, my_ooredoo_app_installed) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING *`,
+      [sessionId, offerId, customerId, offer.name, offer.real_price, baseSellingPrice, discountAmount, offer.commission_points, offer.commission_amount, pointsEarned, pointsRedeemed, appInstalled]
     );
 
     const descExtra = pointsRedeemed > 0 ? ' (Loyalty Discount)' : '';
@@ -144,6 +145,11 @@ const recordStormEntry = asyncHandler(async (req, res) => {
   const requestedPointsToRedeem = req.body.points_redeemed ? parseFloat(req.body.points_redeemed) : 0;
   const customerId = req.body.customer_id ? parseId(req.body.customer_id, 'customer_id') : null;
   const note = req.body.note ? String(req.body.note).trim().slice(0, 500) : (req.body.phone_number ? req.body.phone_number : null);
+  const isPopNumber = req.body.is_pop_number === true || req.body.is_pop_number === 'true';
+  const popCycle = isPopNumber ? parseInt(req.body.pop_cycle, 10) : null;
+if (isPopNumber && !customerId) throw AppError.badRequest('A customer phone number is required to flag a POP number.', 'CUSTOMER_REQUIRED');
+if (isPopNumber && ![1, 8, 15, 22].includes(popCycle)) throw AppError.badRequest('Choose a POP cycle (1, 8, 15 or 22).', 'INVALID_POP_CYCLE');
+  if (isPopNumber && !customerId) throw AppError.badRequest('A customer phone number is required to flag a POP number.', 'CUSTOMER_REQUIRED');  
 
   const discountAmount = req.body.discount_amount ? parseFloat(req.body.discount_amount) : 0;
   if (discountAmount < 0) throw AppError.badRequest('Discount cannot be negative.');
@@ -157,11 +163,20 @@ const recordStormEntry = asyncHandler(async (req, res) => {
     const { discountValue, pointsEarned, pointsRedeemed, newBalance } = customerId ? await applyLoyaltyRules(client, customerId, 'storm', baseSellingPrice, 0, requestedPointsToRedeem) : { discountValue: 0, pointsEarned: 0, pointsRedeemed: 0, newBalance: 0 };
     
     const { rows } = await client.query(
-      `INSERT INTO session_storm_entries (session_id, customer_id, amount, note, loyalty_earned_snapshot, loyalty_redeemed_snapshot) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
-      [sessionId, customerId, baseSellingPrice, note ? note + ` (Orig: ${amount})` : `Orig: ${amount}`, pointsEarned, pointsRedeemed]
+      `INSERT INTO session_storm_entries (session_id, customer_id, amount, note, loyalty_earned_snapshot, loyalty_redeemed_snapshot, is_pop_number, pop_cycle) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *`,
+      [sessionId, customerId, baseSellingPrice, note ? note + ` (Orig: ${amount})` : `Orig: ${amount}`, pointsEarned, pointsRedeemed, isPopNumber, popCycle]
     );
 
     const finalPaidCash = baseSellingPrice - discountValue;
+
+    if (isPopNumber) {
+  await client.query(
+    `UPDATE customers
+        SET is_pop = TRUE, pop_cycle = $2, pop_marked_at = COALESCE(pop_marked_at, NOW())
+      WHERE id = $1`,
+    [customerId, popCycle]
+  );
+}
     
     const baseDesc = rows[0].note || 'Storm / Bundle';
     const descExtra = pointsRedeemed > 0 ? ' (Loyalty Discount)' : '';

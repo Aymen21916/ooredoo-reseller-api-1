@@ -2,15 +2,20 @@
 
 const axios = require('axios');
 const https = require('https');
+const env   = require('../config/env');
+
+const ahla_phone_number = process.env.AHLA_PHONE_NUMBER
+const ahla_password = process.env.AHLA_PASSWORD
+const ahla_code_pin = process.env.AHLA_CODE_PIN
 
 // This acts as memory. It holds the cookie so we don't have to login again.
 let ooredooCookie = null;
-const httpsAgent = new https.Agent({ rejectUnauthorized: false, family: 4 });
+const httpsAgent = new https.Agent({ rejectUnauthorized: true, family: 4 });
 
 const performOoredooLogin = async () => {
   console.log('[Ooredoo Service] Generating new session cookie...');
   const loginPayload = {
-    app_id: "ussd_app", username: "0557891148", password: "7241",       
+    app_id: "ussd_app", username: ahla_phone_number, password: ahla_password,       
     isdevice: false, device: false, lang: null, app_revision: null,
   };
 
