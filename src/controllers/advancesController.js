@@ -10,6 +10,7 @@ const {
   parsePagination,
   validateAmount,
   validateVoidReason,
+  parseDateOnly,
 } = require('../utils/validators');
 
 // ─── Constants ───────────────────────────────────────────────────────────────
@@ -466,6 +467,208 @@ const voidAdvance = asyncHandler(async (req, res) => {
   }, 200, 'Advance voided.');
 });
 
+// ─── Payroll ────────────────────────────────────────────────────────────────
+// total salary = base + SIM commission + accessory commission
+//                + app-install commission (only when the cashier's checkbox is on)
+
+const APP_COMMISSION_KEY = 'app_install_commission';
+const SALARY_LIMITS = { min: 0, max: 9999999.99, decimals_allowed: 2 };
+
+const round2 = (n) => Math.round((Number(n) || 0) * 100) / 100;
+
+/** "YYYY-MM" (default: current month) -> { month, from, to } with `to` exclusive. */
+const resolveMonth = (raw) => {
+  const now = new Date();
+  let y = now.getFullYear();
+  let m = now.getMonth() + 1;
+  if (raw !== undefined && raw !== '') {
+    const match = /^(\d{4})-(0[1-9]|1[0-2])$/.exec(String(raw));
+    if (!match) throw AppError.badRequest('"month" must be in YYYY-MM format.', 'VALIDATION_ERROR');
+    y = parseInt(match[1], 10);
+    m = parseInt(match[2], 10);
+  }
+  const pad = (n) => String(n).padStart(2, '0');
+  const ny = m === 12 ? y + 1 : y;
+  const nm = m === 12 ? 1 : m + 1;
+  return { month: `${y}-${pad(m)}`, from: `${y}-${pad(m)}-01`, to: `${ny}-${pad(nm)}-01` };
+};
+
+// Commissions are summed in separate sub-queries (NOT joined together) so rows
+// are never multiplied. $1 = first day of month, $2 = first day of next month.
+const PAYROLL_SQL = `
+  SELECT u.id AS cashier_id, u.full_name AS cashier_name, u.store_id, st.name AS store_name,
+         u.app_commission_enabled,
+         COALESCE(bs.base_salary, 0)       AS base_salary,
+         COALESCE(sim.units, 0)            AS sim_units,
+         COALESCE(sim.commission, 0)       AS sim_commission,
+         COALESCE(sim.app_installs, 0)     AS app_installs,
+         COALESCE(sim.app_commission, 0)   AS app_commission_earned,
+         COALESCE(acc.units, 0)            AS accessory_units,
+         COALESCE(acc.commission, 0)       AS accessory_commission,
+         COALESCE(adv.outstanding, 0)      AS outstanding_advance
+    FROM users u
+    LEFT JOIN stores st ON st.id = u.store_id
+    LEFT JOIN LATERAL (
+      SELECT h.base_salary
+        FROM cashier_salary_history h
+       WHERE h.cashier_id = u.id
+         AND h.effective_from <= LEAST($2::date - 1, CURRENT_DATE)
+       ORDER BY h.effective_from DESC, h.id DESC
+       LIMIT 1
+    ) bs ON TRUE
+    LEFT JOIN LATERAL (
+      SELECT COUNT(*) FILTER (WHERE ss.is_voided = FALSE) AS units,
+             COALESCE(SUM(ss.commission_snapshot) FILTER (WHERE ss.is_voided = FALSE), 0) AS commission,
+             COUNT(*) FILTER (WHERE ss.is_voided = FALSE AND ss.my_ooredoo_app_installed) AS app_installs,
+             COALESCE(SUM(ss.app_commission_snapshot)
+                      FILTER (WHERE ss.is_voided = FALSE AND ss.my_ooredoo_app_installed), 0) AS app_commission
+        FROM session_sim_sales ss
+        JOIN cashier_sessions cs ON cs.id = ss.session_id
+       WHERE cs.cashier_id = u.id AND cs.session_date >= $1::date AND cs.session_date < $2::date
+    ) sim ON TRUE
+    LEFT JOIN LATERAL (
+      SELECT COUNT(*) FILTER (WHERE sa.is_voided = FALSE) AS units,
+             COALESCE(SUM(sa.commission_snapshot) FILTER (WHERE sa.is_voided = FALSE), 0) AS commission
+        FROM session_accessory_sales sa
+        JOIN cashier_sessions cs ON cs.id = sa.session_id
+       WHERE cs.cashier_id = u.id AND cs.session_date >= $1::date AND cs.session_date < $2::date
+    ) acc ON TRUE
+    LEFT JOIN LATERAL (
+      SELECT COALESCE(SUM(ca.amount) FILTER (WHERE ca.direction = 'advance'   AND ca.is_voided = FALSE), 0)
+           - COALESCE(SUM(ca.amount) FILTER (WHERE ca.direction = 'repayment' AND ca.is_voided = FALSE), 0)
+             AS outstanding
+        FROM cashier_advances ca
+       WHERE ca.cashier_id = u.id
+    ) adv ON TRUE
+   WHERE u.role = 'cashier' AND u.is_active = TRUE`;
+
+const shapePayroll = (r) => {
+  const base        = round2(r.base_salary);
+  const simC        = round2(r.sim_commission);
+  const accC        = round2(r.accessory_commission);
+  const appEarned   = round2(r.app_commission_earned);
+  const enabled     = r.app_commission_enabled === true;
+  const appCounted  = enabled ? appEarned : 0;
+  const total       = round2(base + simC + accC + appCounted);
+  const outstanding = round2(r.outstanding_advance);
+  return {
+    cashier_id:            r.cashier_id,
+    cashier_name:          r.cashier_name,
+    store_id:              r.store_id,
+    store_name:            r.store_name,
+    base_salary:           base,
+    sim_units:             parseInt(r.sim_units, 10) || 0,
+    sim_commission:        simC,
+    accessory_units:       parseInt(r.accessory_units, 10) || 0,
+    accessory_commission:  accC,
+    app_commission_enabled: enabled,
+    app_installs:          parseInt(r.app_installs, 10) || 0,
+    app_commission_earned: appEarned,   // what the installs are worth
+    app_commission:        appCounted,  // what is actually added (0 when checkbox is off)
+    total_salary:          total,
+    outstanding_advance:   outstanding,
+    net_after_advances:    round2(total - outstanding),
+  };
+};
+
+const readAppCommissionSetting = async (client = db) => {
+  const { rows } = await client.query(`SELECT value FROM payroll_settings WHERE key = $1`, [APP_COMMISSION_KEY]);
+  return rows[0] ? parseFloat(rows[0].value) || 0 : 0;
+};
+
+// GET /api/advances/salary?month=YYYY-MM  (admin)
+const getPayroll = asyncHandler(async (req, res) => {
+  const { month, from, to } = resolveMonth(req.query.month);
+  const [{ rows }, appInstallCommission] = await Promise.all([
+    db.query(`${PAYROLL_SQL} ORDER BY u.full_name ASC`, [from, to]),
+    readAppCommissionSetting(),
+  ]);
+  sendSuccess(res, { month, from, to, app_install_commission: appInstallCommission, items: rows.map(shapePayroll) });
+});
+
+// GET /api/advances/salary/me?month=YYYY-MM  (cashier)
+const getMyPayroll = asyncHandler(async (req, res) => {
+  if (req.user.role !== 'cashier') {
+    throw AppError.forbidden('Only cashiers can view their own salary.', 'INSUFFICIENT_ROLE');
+  }
+  const { month, from, to } = resolveMonth(req.query.month);
+  const { rows } = await db.query(`${PAYROLL_SQL} AND u.id = $3`, [from, to, req.user.id]);
+  if (!rows[0]) throw AppError.notFound('Cashier not found.', 'CASHIER_NOT_FOUND');
+  sendSuccess(res, { month, ...shapePayroll(rows[0]) });
+});
+
+// PUT /api/advances/salary/base  (admin) — adds a new base-salary entry
+const setBaseSalary = asyncHandler(async (req, res) => {
+  const cashierId = parsePositiveInt(req.body.cashier_id, 'cashier_id');
+  const baseSalary = validateAmount(req.body.base_salary, { ...SALARY_LIMITS, fieldName: 'base_salary' });
+  const effectiveFrom = req.body.effective_from ? parseDateOnly(req.body.effective_from, 'effective_from') : null;
+
+  const { rows: userRows } = await db.query(`SELECT id, role, is_active FROM users WHERE id = $1`, [cashierId]);
+  const user = userRows[0];
+  if (!user || user.role !== 'cashier' || user.is_active !== true) {
+    throw AppError.notFound('Cashier not found.', 'CASHIER_NOT_FOUND');
+  }
+
+  const { rows } = await db.query(
+    `INSERT INTO cashier_salary_history (cashier_id, base_salary, effective_from, created_by)
+     VALUES ($1, $2, COALESCE($3::date, CURRENT_DATE), $4)
+     RETURNING id, cashier_id, base_salary, to_char(effective_from, 'YYYY-MM-DD') AS effective_from`,
+    [cashierId, baseSalary, effectiveFrom, req.user.id]
+  );
+
+  audit({
+    userId: req.user.id, action: 'INSERT', table: 'cashier_salary_history', recordId: rows[0].id,
+    newValues: { cashier_id: cashierId, base_salary: baseSalary, effective_from: rows[0].effective_from },
+    description: 'base_salary', ip: req.clientIp,
+  });
+
+  sendCreated(res, { ...rows[0], base_salary: parseFloat(rows[0].base_salary) }, 'Base salary updated.');
+});
+
+// PATCH /api/advances/salary/app-commission  (admin) — the per-cashier checkbox
+const setAppCommissionEnabled = asyncHandler(async (req, res) => {
+  const cashierId = parsePositiveInt(req.body.cashier_id, 'cashier_id');
+  if (typeof req.body.enabled !== 'boolean') {
+    throw AppError.badRequest('"enabled" must be true or false.', 'VALIDATION_ERROR');
+  }
+  const { rows } = await db.query(
+    `UPDATE users SET app_commission_enabled = $1
+      WHERE id = $2 AND role = 'cashier' AND is_active = TRUE
+      RETURNING id, app_commission_enabled`,
+    [req.body.enabled, cashierId]
+  );
+  if (!rows[0]) throw AppError.notFound('Cashier not found.', 'CASHIER_NOT_FOUND');
+
+  audit({
+    userId: req.user.id, action: 'UPDATE', table: 'users', recordId: cashierId,
+    newValues: { app_commission_enabled: req.body.enabled },
+    description: 'app_commission_enabled', ip: req.clientIp,
+  });
+
+  sendSuccess(res, rows[0], 200, 'Updated.');
+});
+
+// GET /api/advances/settings  (admin)
+const getPayrollSettings = asyncHandler(async (req, res) => {
+  sendSuccess(res, { app_install_commission: await readAppCommissionSetting() });
+});
+
+// PUT /api/advances/settings  (admin)
+const updatePayrollSettings = asyncHandler(async (req, res) => {
+  const amount = validateAmount(req.body.app_install_commission, { ...SALARY_LIMITS, fieldName: 'app_install_commission' });
+  await db.query(
+    `INSERT INTO payroll_settings (key, value, updated_by) VALUES ($1, $2, $3)
+     ON CONFLICT (key) DO UPDATE
+       SET value = EXCLUDED.value, updated_at = NOW(), updated_by = EXCLUDED.updated_by`,
+    [APP_COMMISSION_KEY, amount, req.user.id]
+  );
+  audit({
+    userId: req.user.id, action: 'UPDATE', table: 'payroll_settings', recordId: 0,
+    newValues: { [APP_COMMISSION_KEY]: amount }, ip: req.clientIp,
+  });
+  sendSuccess(res, { app_install_commission: amount }, 200, 'Settings saved.');
+});
+
 module.exports = {
   createAdvance,
   createRepayment,
@@ -473,4 +676,10 @@ module.exports = {
   getAllAdvances,
   getCashierAdvances,
   voidAdvance,
+  getPayroll,
+  getMyPayroll,
+  setBaseSalary,
+  setAppCommissionEnabled,
+  getPayrollSettings,
+  updatePayrollSettings,
 };

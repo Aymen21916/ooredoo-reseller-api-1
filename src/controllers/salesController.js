@@ -119,9 +119,15 @@ const recordSimSale = asyncHandler(async (req, res) => {
     const { discountValue, pointsEarned, pointsRedeemed, newBalance } = customerId ? await applyLoyaltyRules(client, customerId, 'sim', baseSellingPrice, offer.loyalty_points, requestedPointsToRedeem) : { discountValue: 0, pointsEarned: 0, pointsRedeemed: 0, newBalance: 0 };
     const finalPaidCash = baseSellingPrice - discountValue;
     
+    let appCommission = 0;
+    if (appInstalled) {
+      const { rows: pRows } = await client.query(`SELECT value FROM payroll_settings WHERE key = 'app_install_commission'`);
+      appCommission = pRows[0] ? parseFloat(pRows[0].value) || 0 : 0;
+    }
+
     const { rows } = await client.query(
-      `INSERT INTO session_sim_sales (session_id, offer_id, customer_id, offer_name_snapshot, real_price_snapshot, selling_price_snapshot, discount_snapshot, commission_points_snapshot, commission_snapshot, loyalty_earned_snapshot, loyalty_redeemed_snapshot, my_ooredoo_app_installed) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING *`,
-      [sessionId, offerId, customerId, offer.name, offer.real_price, baseSellingPrice, discountAmount, offer.commission_points, offer.commission_amount, pointsEarned, pointsRedeemed, appInstalled]
+      `INSERT INTO session_sim_sales (session_id, offer_id, customer_id, offer_name_snapshot, real_price_snapshot, selling_price_snapshot, discount_snapshot, commission_points_snapshot, commission_snapshot, loyalty_earned_snapshot, loyalty_redeemed_snapshot, my_ooredoo_app_installed, app_commission_snapshot) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) RETURNING *`,
+      [sessionId, offerId, customerId, offer.name, offer.real_price, baseSellingPrice, discountAmount, offer.commission_points, offer.commission_amount, pointsEarned, pointsRedeemed, appInstalled, appCommission]
     );
 
     const descExtra = pointsRedeemed > 0 ? ' (Loyalty Discount)' : '';
