@@ -155,6 +155,13 @@ const recordStormEntry = asyncHandler(async (req, res) => {
   const popCycle = isPopNumber ? parseInt(req.body.pop_cycle, 10) : null;
 if (isPopNumber && !customerId) throw AppError.badRequest('A customer phone number is required to flag a POP number.', 'CUSTOMER_REQUIRED');
 if (isPopNumber && ![1, 8, 15, 22].includes(popCycle)) throw AppError.badRequest('Choose a POP cycle (1, 8, 15 or 22).', 'INVALID_POP_CYCLE');
+
+  // Client type (optional): regular | corporate (+ the client's custcode)
+  const clientType = ['regular', 'corporate'].includes(req.body.client_type) ? req.body.client_type : null;
+  const custCode = clientType === 'corporate' ? String(req.body.cust_code || '').trim() : null;
+  if (req.body.client_type && !clientType) throw AppError.badRequest('client_type must be "regular" or "corporate".', 'INVALID_CLIENT_TYPE');
+  if (clientType && !customerId) throw AppError.badRequest('A customer phone number is required to set the client type.', 'CUSTOMER_REQUIRED');
+  if (clientType === 'corporate' && !/^[A-Za-z0-9._\-\/]{1,30}$/.test(custCode)) throw AppError.badRequest('Enter the corporate client custcode (letters, digits, - _ . / only, max 30 characters).', 'INVALID_CUST_CODE');
   if (isPopNumber && !customerId) throw AppError.badRequest('A customer phone number is required to flag a POP number.', 'CUSTOMER_REQUIRED');  
 
   const discountAmount = req.body.discount_amount ? parseFloat(req.body.discount_amount) : 0;
@@ -169,8 +176,8 @@ if (isPopNumber && ![1, 8, 15, 22].includes(popCycle)) throw AppError.badRequest
     const { discountValue, pointsEarned, pointsRedeemed, newBalance } = customerId ? await applyLoyaltyRules(client, customerId, 'storm', baseSellingPrice, 0, requestedPointsToRedeem) : { discountValue: 0, pointsEarned: 0, pointsRedeemed: 0, newBalance: 0 };
     
     const { rows } = await client.query(
-      `INSERT INTO session_storm_entries (session_id, customer_id, amount, note, loyalty_earned_snapshot, loyalty_redeemed_snapshot, is_pop_number, pop_cycle) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *`,
-      [sessionId, customerId, baseSellingPrice, note ? note + ` (Orig: ${amount})` : `Orig: ${amount}`, pointsEarned, pointsRedeemed, isPopNumber, popCycle]
+      `INSERT INTO session_storm_entries (session_id, customer_id, amount, note, loyalty_earned_snapshot, loyalty_redeemed_snapshot, is_pop_number, pop_cycle, client_type, cust_code) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING *`,
+      [sessionId, customerId, baseSellingPrice, note ? note + ` (Orig: ${amount})` : `Orig: ${amount}`, pointsEarned, pointsRedeemed, isPopNumber, popCycle, clientType, custCode]
     );
 
     const finalPaidCash = baseSellingPrice - discountValue;
@@ -184,6 +191,13 @@ if (isPopNumber && ![1, 8, 15, 22].includes(popCycle)) throw AppError.badRequest
   );
 }
     
+    if (clientType) {
+      await client.query(
+        `UPDATE customers SET client_type = $2, cust_code = $3 WHERE id = $1`,
+        [customerId, clientType, custCode]
+      );
+    }
+
     const baseDesc = rows[0].note || 'Storm / Bundle';
     const descExtra = pointsRedeemed > 0 ? ' (Loyalty Discount)' : '';
     

@@ -66,7 +66,7 @@ const stats = async (client, customerId, lifetimePoints = 0, settings = {}) => {
 
 const lookupByPhone = asyncHandler(async (req, res) => {
   if (!req.query.phone) throw AppError.badRequest('phone is required.', 'VALIDATION_ERROR');
-  const { rows } = await db.query(`SELECT id, phone_number, first_name, last_name, address, profession, notes, created_at, available_points, lifetime_points, is_pop, pop_cycle FROM customers WHERE phone_number = $1`, [normalisePhone(req.query.phone)]);
+  const { rows } = await db.query(`SELECT id, phone_number, first_name, last_name, address, profession, notes, created_at, available_points, lifetime_points, is_pop, pop_cycle, client_type, cust_code FROM customers WHERE phone_number = $1`, [normalisePhone(req.query.phone)]);
   if (!rows[0]) return sendSuccess(res, null);
   const settings = await getLoyaltySettings(db);
   const s = await stats(db, rows[0].id, parseFloat(rows[0].lifetime_points) || 0, settings);
@@ -97,7 +97,7 @@ const listCustomers = asyncHandler(async (req, res) => {
 
   // Added c.created_by to the SELECT query here
   const { rows } = await db.query(
-    `SELECT c.id, c.phone_number, c.first_name, c.last_name, c.address, c.profession, c.notes, c.created_by, c.created_at, c.updated_at, c.available_points, c.lifetime_points, c.is_pop, c.pop_cycle,
+    `SELECT c.id, c.phone_number, c.first_name, c.last_name, c.address, c.profession, c.notes, c.created_by, c.created_at, c.updated_at, c.available_points, c.lifetime_points, c.is_pop, c.pop_cycle, c.client_type, c.cust_code,
        COALESCE(sim_stats.sim_count, 0) AS sim_count, 
        (COALESCE(sim_stats.sim_base, 0) - (COALESCE(sim_stats.sim_pts, 0) * ${ptVal})) AS sim_total, 
        sim_stats.purchased_offers,
@@ -211,6 +211,23 @@ const updateCustomer = asyncHandler(async (req, res) => {
   updates.pop_cycle = cyc;
 }
 
+if (req.body.client_type !== undefined) {
+    const ct = req.body.client_type === null || req.body.client_type === '' ? null : req.body.client_type;
+    if (ct !== null && !['regular', 'corporate'].includes(ct)) {
+      throw AppError.badRequest('client_type must be "regular", "corporate" or null.', 'VALIDATION_ERROR');
+    }
+    updates.client_type = ct;
+    if (ct === 'corporate') {
+      const code = String(req.body.cust_code || '').trim();
+      if (!/^[A-Za-z0-9._\-\/]{1,30}$/.test(code)) {
+        throw AppError.badRequest('A valid cust_code is required for corporate clients.', 'VALIDATION_ERROR');
+      }
+      updates.cust_code = code;
+    } else {
+      updates.cust_code = null;
+    }
+  }
+  
   if (Object.keys(updates).length === 0) throw AppError.badRequest('No updateable fields provided.', 'VALIDATION_ERROR');
 
   const setClauses = Object.keys(updates).map((k, i) => `${k} = $${i + 2}`);

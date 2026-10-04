@@ -18,6 +18,7 @@ router.put('/pool', financesController.updatePool); // Manual Recharges/Rewards
 
 // ─── Daily Reconciliation ───────────────────────────────────────────────────
 router.get('/reconciliation/today', financesController.getDailyReconciliation);
+router.get('/manual-ledger', financesController.getManualLedger);
 
 // ─── Store Registers ────────────────────────────────────────────────────────
 router.get('/registers', financesController.getRegisters);

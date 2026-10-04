@@ -5,7 +5,8 @@ const AppError = require('../utils/AppError');
 const { asyncHandler, sendSuccess } = require('../utils/asyncHandler');
 const { audit } = require('../utils/audit');
 const cron = require('node-cron');
-const { requireFields, parseId, parseString } = require('../utils/validators');
+const { requireFields, parseId, parseString, validateDateRange } = require('../utils/validators');
+const { MANUAL_ITEMS_SQL } = require('../utils/manualLedger');
 
 const { callOoredooApi } = require('../services/ooredooService');
 
@@ -284,4 +285,50 @@ const updateRegister = asyncHandler(async (req, res) => {
   sendSuccess(res, { store_id: result.store_id, current_cash: parseFloat(result.cash_amount) }, 200, `Register updated.`);
 });
 
-module.exports = { getPool, getRegisters, syncPoolWithOoredoo, autoConvertPoints, updatePool, getDailyReconciliation, updateRegister };
+// GET /api/finances/manual-ledger?from=YYYY-MM-DD&to=YYYY-MM-DD
+// History of every manually added Side-Ledger item (recharges + rewards) in a period.
+const getManualLedger = asyncHandler(async (req, res) => {
+  const { from, to } = validateDateRange(req.query.from, req.query.to);
+
+  const [{ rows: items }, { rows: sums }] = await Promise.all([
+    db.query(
+      `SELECT m.id, m.type, m.amount, m.note, m.created_at, u.full_name AS added_by
+         FROM (${MANUAL_ITEMS_SQL}) m
+         LEFT JOIN users u ON u.id = m.updated_by
+        WHERE m.created_at::date BETWEEN $1 AND $2
+        ORDER BY m.created_at DESC, m.id DESC
+        LIMIT 1000`,
+      [from, to]
+    ),
+    db.query(
+      `SELECT COALESCE(SUM(m.amount) FILTER (WHERE m.type = 'RECHARGE'), 0) AS recharges,
+              COALESCE(SUM(m.amount) FILTER (WHERE m.type = 'REWARD'), 0)   AS rewards,
+              COUNT(*)::int                                                 AS count
+         FROM (${MANUAL_ITEMS_SQL}) m
+        WHERE m.created_at::date BETWEEN $1 AND $2`,
+      [from, to]
+    ),
+  ]);
+
+  const count = sums[0]?.count || 0;
+  sendSuccess(res, {
+    from,
+    to,
+    totals: {
+      recharges: parseFloat(sums[0]?.recharges) || 0,
+      rewards: parseFloat(sums[0]?.rewards) || 0,
+      count,
+    },
+    truncated: count > items.length,
+    items: items.map((r) => ({
+      id: r.id,
+      type: r.type,
+      amount: parseFloat(r.amount) || 0,
+      note: r.note || '',
+      added_by: r.added_by || null,
+      created_at: r.created_at,
+    })),
+  });
+});
+
+module.exports = { getPool, getRegisters, syncPoolWithOoredoo, autoConvertPoints, updatePool, getDailyReconciliation, updateRegister, getManualLedger };

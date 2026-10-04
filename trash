@@ -1,0 +1,72 @@
+const getTieredPrelevement = (targetCashierId, targetStoreId, includeManual = false) => {
+    const monthlyTotals = {};
+    for (const row of prelevementRes.rows) {
+      if (targetCashierId && row.cashier_id !== targetCashierId) continue;
+      if (targetStoreId && row.store_id !== targetStoreId) continue;
+      monthlyTotals[row.month] = (monthlyTotals[row.month] || 0) + parseFloat(row.base_amount);
+    }
+    if (includeManual) {
+      for (const row of manualRecharges) {
+        monthlyTotals[row.month] = (monthlyTotals[row.month] || 0) + (parseFloat(row.total) || 0);
+      }
+    }
+    let totalPrelevement = 0;
+    for (const amt of Object.values(monthlyTotals)) totalPrelevement += calculatePrelevement(amt);
+    return totalPrelevement;
+  };
+
+  const getMonthlySummary = asyncHandler(async (req, res) => {
+  const conditions = [];
+  const params = [];
+  const ptVal = await getPtVal();
+
+  if (req.query.from) { params.push(parseDate(req.query.from, 'from')); conditions.push(`month >= DATE_TRUNC('month', $${params.length}::date)::date`); }
+  if (req.query.to) { params.push(parseDate(req.query.to, 'to')); conditions.push(`month <= DATE_TRUNC('month', $${params.length}::date)::date`); }
+  if (req.query.store_id) { params.push(parseId(req.query.store_id, 'store_id')); conditions.push(`store_id = $${params.length}`); }
+
+  const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
+
+  const { rows } = await db.query(
+    `SELECT v.month, v.store_id, s.name AS store_name,
+            v.total_sim_units, v.total_selling_price, v.total_real_price,
+            v.total_storm, v.total_accessories, v.total_commissions,
+            v.total_debts, v.gross_profit, v.days_with_activity,
+            v.loyalty_points_redeemed, v.loyalty_driven_revenue
+       FROM v_monthly_summary v
+       JOIN stores s ON s.id = v.store_id
+       ${where} ORDER BY v.month DESC, v.store_id ASC`, params
+  );
+
+  const decorated = rows.map((r) => {
+    const revenue = (parseFloat(r.total_selling_price) || 0) + (parseFloat(r.total_storm) || 0) + (parseFloat(r.total_accessories) || 0);
+    const base_amount = (parseFloat(r.total_storm) || 0) + (parseFloat(r.total_real_price) || 0);
+    const tieredPrelevement = calculatePrelevement(base_amount);
+    
+    // PURE GROSS PROFIT MATH for monthly
+    const profit = (parseFloat(r.gross_profit) || 0) + tieredPrelevement;
+    const loyaltyPts = parseFloat(r.loyalty_points_redeemed) || 0;
+    
+    return {
+      ...r,
+      loyalty_points_redeemed: loyaltyPts,
+      loyalty_discount_dzd: loyaltyPts * ptVal,
+      loyalty_driven_revenue: parseFloat(r.loyalty_driven_revenue) || 0,
+      total_revenue: revenue,
+      gross_profit:  profit,
+      margin_pct:    revenue > 0 ? (profit / revenue) * 100 : 0,
+    };
+  });
+
+  sendSuccess(res, decorated);
+});
+
+const { rows: prelevementMonths } = await db.query(
+    `WITH combined AS (
+       SELECT DATE_TRUNC('month', se.entered_at)::date AS month, se.amount AS base_amount 
+       FROM session_storm_entries se WHERE is_voided = FALSE AND session_id IN (SELECT id FROM cashier_sessions WHERE cashier_id = $1 AND session_date BETWEEN $2 AND $3)
+       UNION ALL
+       SELECT DATE_TRUNC('month', ss.sold_at)::date AS month, ss.real_price_snapshot AS base_amount 
+       FROM session_sim_sales ss WHERE is_voided = FALSE AND session_id IN (SELECT id FROM cashier_sessions WHERE cashier_id = $1 AND session_date BETWEEN $2 AND $3)
+     )
+     SELECT month, SUM(base_amount) AS base_amount FROM combined GROUP BY month`, [cashierId, from, to]
+  );
