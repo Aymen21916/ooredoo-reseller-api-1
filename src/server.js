@@ -28,6 +28,7 @@ const expensesRoutes = require('./routes/expensesRoutes');
 const settingsRoutes = require('./routes/settingsRoutes');
 const storeRoutes = require('./routes/storeRoutes');
 const discountRoutes = require('./routes/discountRoutes');
+const registerLedgerRoutes = require('./routes/registerLedgerRoutes');
 // const { set } = require('fast-check');
 
 const app = express();
@@ -110,6 +111,7 @@ app.use('/api/advances', advancesRoutes);
 app.use('/api/settings', settingsRoutes);
 app.use('/api/stores', storeRoutes);
 app.use('/api/discounts', discountRoutes);
+app.use('/api/register-ledger', registerLedgerRoutes);
 
 // ─── 404 & Global Error Handling ─────────────────────────────────────────────
 app.use(notFoundHandler);

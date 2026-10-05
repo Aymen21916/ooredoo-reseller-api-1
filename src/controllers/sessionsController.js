@@ -5,6 +5,7 @@ const AppError = require('../utils/AppError');
 const { asyncHandler, sendSuccess, sendCreated } = require('../utils/asyncHandler');
 const { audit }  = require('../utils/audit');
 const { parseId, parsePositiveInt, parseDate } = require('../utils/validators');
+const { recordSessionCollection } = require('../utils/registerLedger');
 
 const resolveSession = async (sessionId, req, client) => {
   const db_ = client || db;
@@ -171,15 +172,21 @@ const closeSession = asyncHandler(async (req, res) => {
   
   const discrepancy = manualCash !== null ? manualCash - expectedCash : null;
 
-  const { rows } = await db.query(
-    `UPDATE cashier_sessions 
-     SET status = 'closed', closed_at = NOW(), closing_cash = $1, cash_discrepancy = $2 
-     WHERE id = $3 RETURNING *`,
-    [manualCash, discrepancy, id]
-  );
+  // Close the session AND put its money into the register ledger, atomically.
+  const closed = await db.withTransaction(async (client) => {
+    const { rows } = await client.query(
+      `UPDATE cashier_sessions 
+       SET status = 'closed', closed_at = NOW(), closing_cash = $1, cash_discrepancy = $2 
+       WHERE id = $3 AND status = 'open' RETURNING *`,
+      [manualCash, discrepancy, id]
+    );
+    if (!rows[0]) throw AppError.badRequest('Session already closed.');
+    await recordSessionCollection(client, id, req.user.id);
+    return rows[0];
+  });
   
   audit({ userId: req.user.id, action: 'SESSION_CLOSE', table: 'cashier_sessions', recordId: id, ip: req.clientIp });
-  sendSuccess(res, rows[0], 200, 'Session closed and cash recorded.');
+  sendSuccess(res, closed, 200, 'Session closed and cash recorded.');
 });
 
 const assignStock = asyncHandler(async (req, res) => {
