@@ -1,7 +1,7 @@
 'use strict';
 
 const AppError = require('./AppError');
-const { parseId, parseDate } = require('./validators');
+const { parseId, parseDateTime } = require('./validators');
 
 // How a closed session turns into register money:
 //   true  → total = SIM + Storm + Products − debts − register expenses
@@ -92,8 +92,16 @@ const buildFilters = (query = {}) => {
 
   let from = null;
   let to = null;
-  if (query.from) { from = parseDate(query.from, 'from'); params.push(from); scope.push(`l.entry_date >= $${params.length}`); }
-  if (query.to)   { to = parseDate(query.to, 'to');       params.push(to);   scope.push(`l.entry_date <= $${params.length}`); }
+  if (query.from) { 
+    from = parseDateTime(query.from, 'from'); 
+    params.push(from); 
+    scope.push(`l.created_at >= $${params.length}`); 
+  }
+  if (query.to) { 
+    to = parseDateTime(query.to, 'to'); 
+    params.push(to); 
+    scope.push(`l.created_at <= $${params.length}`); 
+  }
   if (from && to && from > to) throw AppError.badRequest('"from" must be on or before "to".', 'INVALID_DATE_RANGE');
 
   const status1 = query.status1 || 'all';

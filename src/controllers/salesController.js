@@ -344,12 +344,29 @@ const voidTransaction = asyncHandler(async (req, res) => {
   const ptVal = sRows[0] ? parseFloat(sRows[0].value) : 1;
 
   await db.withTransaction(async (client) => {
-    const { rows } = await client.query(`SELECT t.*, cs.cashier_id, u.store_id FROM ${table} t JOIN cashier_sessions cs ON cs.id = t.session_id JOIN users u ON u.id = cs.cashier_id WHERE t.id = $1 FOR UPDATE`, [transactionId]);
+    const { rows } = await client.query(
+      `SELECT t.*, cs.cashier_id, u.store_id 
+       FROM ${table} t 
+       JOIN cashier_sessions cs ON cs.id = t.session_id 
+       JOIN users u ON u.id = cs.cashier_id 
+       WHERE t.id = $1 FOR UPDATE`, 
+      [transactionId]
+    );
     const row = rows[0];
     if (!row) throw AppError.notFound('Transaction not found.');
     if (row.is_voided) throw AppError.conflict('Transaction is already voided.', 'ALREADY_VOIDED');
 
     await client.query(`UPDATE ${table} SET is_voided = TRUE, voided_at = NOW(), voided_by = $1, void_reason = $2 WHERE id = $3`, [req.user.id, reason, transactionId]);
+
+    // Restore SIM stock to store balance when voiding a SIM sale
+    if (type === 'sim' && row.store_id) {
+      await client.query(
+        `UPDATE sim_balances 
+         SET quantity = quantity + 1 
+         WHERE owner_type = 'store' AND owner_id = $1`,
+        [row.store_id]
+      );
+    }
 
     if (type !== 'debt' && row.customer_id) {
       const earned = parseFloat(row.loyalty_earned_snapshot || 0);

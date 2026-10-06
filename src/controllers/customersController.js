@@ -88,6 +88,7 @@ const listCustomers = asyncHandler(async (req, res) => {
   if (req.query.type === 'accessory') conditions.push('acc_stats.acc_count > 0');
   if (req.query.offer_id) { params.push(String(req.query.offer_id)); conditions.push(`$${params.length} = ANY(sim_stats.purchased_offers::text[])`); }
   if (req.query.created_by) { params.push(parseInt(req.query.created_by, 10)); conditions.push(`c.created_by = $${params.length}`); }
+  if (req.query.validation === 'invalid') conditions.push(`v.status = 'invalid'`);
 
   const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
   params.push(limit, offset);
@@ -98,6 +99,8 @@ const listCustomers = asyncHandler(async (req, res) => {
   // Added c.created_by to the SELECT query here
   const { rows } = await db.query(
     `SELECT c.id, c.phone_number, c.first_name, c.last_name, c.address, c.profession, c.notes, c.created_by, c.created_at, c.updated_at, c.available_points, c.lifetime_points, c.is_pop, c.pop_cycle, c.client_type, c.cust_code,
+       v.status AS validation_status, v.review_note AS validation_note,
+       (SELECT COUNT(*) FROM customer_corrections cc WHERE cc.customer_id = c.id AND cc.status = 'pending')::int AS pending_corrections,
        COALESCE(sim_stats.sim_count, 0) AS sim_count, 
        (COALESCE(sim_stats.sim_base, 0) - (COALESCE(sim_stats.sim_pts, 0) * ${ptVal})) AS sim_total, 
        sim_stats.purchased_offers,
@@ -108,6 +111,7 @@ const listCustomers = asyncHandler(async (req, res) => {
        COALESCE(acc_stats.acc_profit, 0) AS accessory_profit,
        GREATEST(sim_stats.sim_last, storm_stats.storm_last, acc_stats.acc_last) AS last_purchase_at
      FROM customers c
+     LEFT JOIN customer_validations v ON v.customer_id = c.id
      LEFT JOIN LATERAL (SELECT COUNT(*) FILTER (WHERE is_voided = FALSE) AS sim_count, COALESCE(SUM(selling_price_snapshot) FILTER (WHERE is_voided = FALSE), 0) AS sim_base, COALESCE(SUM(loyalty_redeemed_snapshot) FILTER (WHERE is_voided = FALSE), 0) AS sim_pts, MAX(sold_at) AS sim_last, array_agg(DISTINCT offer_id) FILTER (WHERE is_voided = FALSE) AS purchased_offers FROM session_sim_sales WHERE customer_id = c.id ${dSim}) sim_stats ON TRUE
      LEFT JOIN LATERAL (SELECT COUNT(*) FILTER (WHERE is_voided = FALSE) AS storm_count, COALESCE(SUM(amount) FILTER (WHERE is_voided = FALSE), 0) AS storm_base, COALESCE(SUM(loyalty_redeemed_snapshot) FILTER (WHERE is_voided = FALSE), 0) AS storm_pts, MAX(entered_at) AS storm_last FROM session_storm_entries WHERE customer_id = c.id ${dStorm}) storm_stats ON TRUE
      LEFT JOIN LATERAL (SELECT COUNT(*) FILTER (WHERE is_voided = FALSE) AS acc_count, COALESCE(SUM(price_snapshot) FILTER (WHERE is_voided = FALSE), 0) AS acc_base, COALESCE(SUM(price_snapshot - real_price_snapshot) FILTER (WHERE is_voided = FALSE), 0) AS acc_profit, COALESCE(SUM(loyalty_redeemed_snapshot) FILTER (WHERE is_voided = FALSE), 0) AS acc_pts, MAX(sold_at) AS acc_last FROM session_accessory_sales WHERE customer_id = c.id ${dAcc}) acc_stats ON TRUE

@@ -89,6 +89,20 @@ const parseDate = (value, fieldName) => {
 };
 
 /**
+ * Parse a datetime string (e.g., from a datetime-local input). Throws 400 on failure.
+ *
+ * @param {any}    value
+ * @param {string} fieldName
+ * @returns {string} 
+ */
+const parseDateTime = (value, fieldName) => {
+  if (typeof value !== 'string' || Number.isNaN(Date.parse(value))) {
+    throw AppError.badRequest(`"${fieldName}" must be a valid date and time.`, 'VALIDATION_ERROR');
+  }
+  return value;
+};
+
+/**
  * Validate that a string is non-empty and within maxLength.
  * @param {any}    value
  * @param {string} fieldName
@@ -388,6 +402,7 @@ module.exports = {
   parsePositiveInt,
   parseId,
   parseDate,
+  parseDateTime,
   parseString,
   parsePagination,
 
