@@ -65,5 +65,5 @@ COMMENT ON VIEW v_cashier_sim_inventory IS
 
 pool
   .query(SQL)
-  .then(() => { console.log('✓ Generic SIM migration applied.'); return pool.end(); })
+  .then(() => { /*console.log('✓ Generic SIM migration applied.');*/ return pool.end(); })
   .catch((err) => { console.error('✗ Failed:', err.message); pool.end(); process.exit(1); });

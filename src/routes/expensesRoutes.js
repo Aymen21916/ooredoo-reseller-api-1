@@ -20,6 +20,9 @@ router.use(authenticate);
 // resolves to the admin list handler.
 router.get('/', authorize('admin'), expensesController.listAllExpenses);
 
+// ─── Register cash (cashier: own store + open session / admin: ?store_id=) ───
+router.get('/register-cash', authorize('cashier', 'admin'), expensesController.getRegisterCashInfo);
+
 // ─── Cashier-only endpoint ───────────────────────────────────────────────────
 router.get('/me', authorize('cashier'), expensesController.listMyExpenses);
 

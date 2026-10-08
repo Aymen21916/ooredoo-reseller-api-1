@@ -7,6 +7,7 @@ const {
   parseId, parsePagination, parseDateOnly,
   validateAmount, validateVoidReason,
 } = require('../utils/validators');
+const { lockStore, getRegisterCash } = require('../utils/registerLedger');
 
 // ─── Constants ──────────────────────────────────────────────────────────────
 
@@ -22,7 +23,7 @@ const EXPENSE_AMOUNT_MAX = 9_999_999.99;
 /**
  * Insert an `audit_logs` row using the supplied transactional client so the
  * audit entry shares the same SQL transaction as the register-expense and
- * `store_register_state` writes (Requirement 3.15).
+ * `ledger writes (Requirement 3.15).
  *
  * The shape mirrors the fire-and-forget `utils/audit.js` helper so callers
  * do not need to know which variant is in use.
@@ -132,31 +133,6 @@ const findOpenSessionId = async (cashierId, client) => {
   return rows[0]?.id ?? null;
 };
 
-/**
- * Read the latest `store_register_state` row for a store inside the supplied
- * transaction, taking a row-level lock. Returns `{ id, cash_amount }` or
- * `{ id: null, cash_amount: 0 }` if the register has never been initialised
- * (matches the existing `loadCurrentRegister` zero-fallback).
- *
- * The `FOR UPDATE` lock is the linchpin of Requirement 3.8 — without it,
- * two concurrent expenses can both read the same balance and double-spend
- * the register, defeating the schema's `cash_amount >= 0` CHECK only after
- * the over-spend has happened.
- */
-const lockLatestRegisterRow = async (storeId, client) => {
-  const { rows } = await client.query(
-    `SELECT id, cash_amount
-       FROM store_register_state
-      WHERE store_id = $1
-      ORDER BY id DESC
-      LIMIT 1
-      FOR UPDATE`,
-    [storeId]
-  );
-  if (!rows[0]) return { id: null, cash_amount: 0 };
-  return { id: rows[0].id, cash_amount: parseFloat(rows[0].cash_amount) || 0 };
-};
-
 // ─── POST /api/finances/expenses  — cashier OR admin ────────────────────────
 //
 //   Body (cashier):  { amount, description, category }
@@ -238,14 +214,18 @@ const createExpense = asyncHandler(async (req, res) => {
       throw AppError.forbidden('Only cashiers and admins can record expenses.', 'FORBIDDEN');
     }
 
-    // Lock the latest register-state row for the store and verify funds.
-    const previous = await lockLatestRegisterRow(storeId, client);
+    // Serialise with every other money movement of this store, then verify funds
+    // against the REGISTER LEDGER (not the legacy store_register_state table).
+    //   cashier → ledger balance + what his open session has sold so far
+    //   admin   → ledger balance
+    await lockStore(client, storeId);
+    const cash = await getRegisterCash(client, storeId, sessionId);
 
-    if (previous.cash_amount < amount) {
+    if (cash.available + 0.001 < amount) {
       throw AppError.badRequest(
         'The register does not have enough cash to cover this expense.',
         'INSUFFICIENT_REGISTER_CASH'
-      ).withDetails({ current_balance: previous.cash_amount });
+      ).withDetails({ current_balance: cash.available });
     }
 
     // Insert the expense row.
@@ -259,20 +239,19 @@ const createExpense = asyncHandler(async (req, res) => {
     );
     const expense = expRows[0];
 
-    // Append a new register-state row reflecting the deduction.
-    const newCash = Number((previous.cash_amount - amount).toFixed(2));
-    const stateNotes = `Register expense #${expense.id}: ${description}`;
+    // Cashier expenses are deducted automatically when the session closes
+    // (register_ledger.expenses_amount). Admin expenses have no session, so they
+    // take the money out of the register right now with a linked "out" entry.
+    if (role === 'admin') {
+      await client.query(
+        `INSERT INTO register_ledger
+           (store_id, user_id, source, direction, entry_date, description,
+            total_amount, created_by, expense_id)
+         VALUES ($1, $2, 'manual', 'out', $3, $4, $5, $2, $6)`,
+        [storeId, req.user.id, expenseDate, `Expense #${expense.id}: ${description}`.slice(0, 500), amount, expense.id]
+      );
+    }
 
-    const { rows: stateRows } = await client.query(
-      `INSERT INTO store_register_state
-         (store_id, cash_amount, updated_by, notes)
-       VALUES ($1, $2, $3, $4)
-       RETURNING id, cash_amount, updated_at`,
-      [storeId, newCash, req.user.id, stateNotes]
-    );
-    const newState = stateRows[0];
-
-    // Audit log for both writes — inside the same transaction (Req 3.15).
     await auditWithin(client, {
       userId:    req.user.id,
       action:    'INSERT',
@@ -289,30 +268,34 @@ const createExpense = asyncHandler(async (req, res) => {
       ip:        req.clientIp,
     });
 
-    await auditWithin(client, {
-      userId:    req.user.id,
-      action:    'UPDATE',
-      table:     'store_register_state',
-      recordId:  newState.id,
-      oldValues: { cash_amount: previous.cash_amount },
-      newValues: {
-        cash_amount: newCash,
-        delta:       -amount,
-        notes:       stateNotes,
-        expense_id:  expense.id,
-      },
-      description: `Register expense #${expense.id} created`,
-      ip:          req.clientIp,
-    });
-
     return {
       ...expense,
       amount: parseFloat(expense.amount),
-      register_balance_after: newCash,
+      register_balance_after: Number((cash.available - amount).toFixed(2)),
     };
   });
 
   sendCreated(res, result, 'Register expense recorded.');
+});
+
+// ─── GET /api/finances/expenses/register-cash ───────────────────────────────
+//   cashier: figures for his store + open session (store_id is taken from his account)
+//   admin  : ?store_id=<id> → ledger balance of that store
+//   Used by the "Record expense" modal to show how much cash is in the register.
+
+const getRegisterCashInfo = asyncHandler(async (req, res) => {
+  let storeId;
+  let sessionId = null;
+
+  if (req.user.role === 'cashier') {
+    ({ storeId, sessionId } = await resolveCashierContext(req.user.id, db));
+  } else if (req.user.role === 'admin') {
+    storeId = parseId(req.query.store_id, 'store_id');
+  } else {
+    throw AppError.forbidden('Only cashiers and admins can read the register cash.', 'FORBIDDEN');
+  }
+
+  sendSuccess(res, await getRegisterCash(db, storeId, sessionId));
 });
 
 // ─── GET /api/finances/expenses/me  — cashier, current session ──────────────
@@ -380,6 +363,9 @@ const listAllExpenses = asyncHandler(async (req, res) => {
     conditions.push(`re.expense_date <= $${params.length}`);
   }
 
+  // The old automatic "daily cash collection" rows are replaced by the Register Ledger.
+  conditions.push(`re.description NOT LIKE 'Automatic Daily Cash Collection%'`);
+
   // `voided` filter: 'true' | 'false' | 'all'. Default excludes voided rows.
   const voidedRaw = req.query.voided !== undefined ? String(req.query.voided) : 'false';
   if (voidedRaw === 'true') {
@@ -425,9 +411,9 @@ const listAllExpenses = asyncHandler(async (req, res) => {
 //   Admin:   any non-voided row.
 //
 //   Atomically (within one transaction):
-//     1. Lock the register-state row for the expense's store.
+//     1. Lock the expense's store.
 //     2. Soft-void the `register_expenses` row.
-//     3. Append a new `store_register_state` row adding the amount back.
+//     3. Give the money back to the register ledger (void the linked entry / add a refund entry).
 //     4. Audit-log both updates.
 
 const voidExpense = asyncHandler(async (req, res) => {
@@ -468,8 +454,8 @@ const voidExpense = asyncHandler(async (req, res) => {
       throw AppError.forbidden('Only cashiers and admins can void expenses.', 'FORBIDDEN');
     }
 
-    // 3. Lock the latest register-state row for the expense's store.
-    const previous = await lockLatestRegisterRow(expense.store_id, client);
+    // 3. Serialise with the other money movements of the store.
+    await lockStore(client, expense.store_id);
 
     // 4. Mark the expense voided.
     const { rows: voidRows } = await client.query(
@@ -483,22 +469,39 @@ const voidExpense = asyncHandler(async (req, res) => {
       [req.user.id, reason, expenseId]
     );
     const voided = voidRows[0];
+    const amount = parseFloat(expense.amount);
 
-    // 5. Append a register-state row that restores the cash.
-    const amount     = parseFloat(expense.amount);
-    const newCash    = Number((previous.cash_amount + amount).toFixed(2));
-    const stateNotes = `Void of register expense #${expense.id}`;
-
-    const { rows: stateRows } = await client.query(
-      `INSERT INTO store_register_state
-         (store_id, cash_amount, updated_by, notes)
-       VALUES ($1, $2, $3, $4)
-       RETURNING id, cash_amount, updated_at`,
-      [expense.store_id, newCash, req.user.id, stateNotes]
+    // 5. Give the money back to the register ledger.
+    //    a) admin expense → void its linked "out" entry
+    //    b) session expense whose session is already closed (its ledger row already
+    //       had the expense deducted) → add a linked "in" refund entry
+    //    c) session expense of a still-open session → nothing to do, the live total updates itself
+    const { rows: outRows } = await client.query(
+      `UPDATE register_ledger
+          SET is_voided = TRUE, voided_at = NOW(), voided_by = $1, void_reason = $2
+        WHERE expense_id = $3 AND direction = 'out' AND is_voided = FALSE
+        RETURNING id`,
+      [req.user.id, `Expense #${expense.id} voided: ${reason}`.slice(0, 500), expense.id]
     );
-    const newState = stateRows[0];
 
-    // 6. Audit log — inside the same transaction (Req 3.15).
+    if (outRows.length === 0 && expense.session_id) {
+      const { rows: sessRows } = await client.query(
+        `SELECT 1 FROM register_ledger
+          WHERE session_id = $1 AND source = 'session' AND is_voided = FALSE`,
+        [expense.session_id]
+      );
+      if (sessRows[0]) {
+        await client.query(
+          `INSERT INTO register_ledger
+             (store_id, user_id, source, direction, entry_date, description,
+              total_amount, created_by, expense_id)
+           VALUES ($1, $2, 'manual', 'in', CURRENT_DATE, $3, $4, $2, $5)`,
+          [expense.store_id, req.user.id, `Refund of voided expense #${expense.id}`, amount, expense.id]
+        );
+      }
+    }
+
+    // 6. Audit log — inside the same transaction.
     await auditWithin(client, {
       userId:    req.user.id,
       action:    'VOID',
@@ -515,29 +518,12 @@ const voidExpense = asyncHandler(async (req, res) => {
       ip:          req.clientIp,
     });
 
-    await auditWithin(client, {
-      userId:    req.user.id,
-      action:    'UPDATE',
-      table:     'store_register_state',
-      recordId:  newState.id,
-      oldValues: { cash_amount: previous.cash_amount },
-      newValues: {
-        cash_amount: newCash,
-        delta:       amount,
-        notes:       stateNotes,
-        expense_id:  expense.id,
-      },
-      description: `Refund register cash from voided expense #${expense.id}`,
-      ip:          req.clientIp,
-    });
-
     return {
-      id:                     voided.id,
-      is_voided:              voided.is_voided,
-      voided_at:              voided.voided_at,
-      voided_by:              voided.voided_by,
-      void_reason:            voided.void_reason,
-      register_balance_after: newCash,
+      id:          voided.id,
+      is_voided:   voided.is_voided,
+      voided_at:   voided.voided_at,
+      voided_by:   voided.voided_by,
+      void_reason: voided.void_reason,
     };
   });
 
@@ -549,4 +535,5 @@ module.exports = {
   listMyExpenses,
   listAllExpenses,
   voidExpense,
+  getRegisterCashInfo,
 };
