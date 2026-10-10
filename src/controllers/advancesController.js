@@ -4,6 +4,7 @@ const db = require('../config/db');
 const AppError = require('../utils/AppError');
 const { asyncHandler, sendCreated, sendSuccess } = require('../utils/asyncHandler');
 const { audit } = require('../utils/audit');
+const { lockStore, storeBalance } = require('../utils/registerLedger');
 const {
   parseId,
   parsePositiveInt,
@@ -505,7 +506,9 @@ const PAYROLL_SQL = `
          COALESCE(sim.app_commission, 0)   AS app_commission_earned,
          COALESCE(acc.units, 0)            AS accessory_units,
          COALESCE(acc.commission, 0)       AS accessory_commission,
-         COALESCE(adv.outstanding, 0)      AS outstanding_advance
+         COALESCE(adv.outstanding, 0)      AS outstanding_advance,
+         COALESCE(pay.paid, 0)             AS paid_amount,
+         COALESCE(pay.deducted, 0)         AS advance_deducted
     FROM users u
     LEFT JOIN stores st ON st.id = u.store_id
     LEFT JOIN LATERAL (
@@ -540,6 +543,14 @@ const PAYROLL_SQL = `
         FROM cashier_advances ca
        WHERE ca.cashier_id = u.id
     ) adv ON TRUE
+    LEFT JOIN LATERAL (
+      SELECT COALESCE(SUM(sp.amount), 0)           AS paid,
+             COALESCE(SUM(sp.advance_deducted), 0) AS deducted
+        FROM salary_payments sp
+       WHERE sp.cashier_id = u.id
+         AND sp.month = to_char($1::date, 'YYYY-MM')
+         AND sp.is_voided = FALSE
+    ) pay ON TRUE
    WHERE u.role = 'cashier' AND u.is_active = TRUE`;
 
 const shapePayroll = (r) => {
@@ -551,6 +562,10 @@ const shapePayroll = (r) => {
   const appCounted  = enabled ? appEarned : 0;
   const total       = round2(base + simC + accC + appCounted);
   const outstanding = round2(r.outstanding_advance);
+  const paid        = round2(r.paid_amount);
+  const deducted    = round2(r.advance_deducted);
+  const remaining   = round2(Math.max(total - paid - deducted, 0));
+  const deductible  = round2(Math.min(Math.max(outstanding, 0), remaining));
   return {
     cashier_id:            r.cashier_id,
     cashier_name:          r.cashier_name,
@@ -568,6 +583,11 @@ const shapePayroll = (r) => {
     total_salary:          total,
     outstanding_advance:   outstanding,
     net_after_advances:    round2(total - outstanding),
+    amount_paid:           paid,        // cash already handed out for this month
+    advance_deducted:      deducted,    // advance already settled from this month's salary
+    remaining_salary:      remaining,   // total − paid − deducted (never below 0)
+    advance_deductible:    deductible,  // the part of the advance that can still be deducted now
+    suggested_cash:        round2(remaining - deductible), // cash due now if the advance is deducted
   };
 };
 
@@ -576,14 +596,52 @@ const readAppCommissionSetting = async (client = db) => {
   return rows[0] ? parseFloat(rows[0].value) || 0 : 0;
 };
 
+const shapePayment = (r) => ({
+  id:               r.id,
+  cashier_id:       r.cashier_id,
+  cashier_name:     r.cashier_name,
+  month:            r.month,
+  amount:           parseFloat(r.amount) || 0,
+  advance_deducted: parseFloat(r.advance_deducted) || 0,
+  note:             r.note,
+  is_voided:        r.is_voided,
+  void_reason:      r.void_reason,
+  paid_by_name:     r.paid_by_name,
+  created_at:       r.created_at,
+});
+
+/** Salary payments of one month (all cashiers, or just one). Voided rows are included and flagged. */
+const loadPayments = async (month, cashierId = null, client = db) => {
+  const params = [month];
+  let where = 'sp.month = $1';
+  if (cashierId) { params.push(cashierId); where += ' AND sp.cashier_id = $2'; }
+  const { rows } = await client.query(
+    `SELECT sp.id, sp.cashier_id, u.full_name AS cashier_name, sp.month, sp.amount, sp.advance_deducted,
+            sp.note, sp.is_voided, sp.void_reason, sp.created_at, a.full_name AS paid_by_name
+       FROM salary_payments sp
+       JOIN users u ON u.id = sp.cashier_id
+       LEFT JOIN users a ON a.id = sp.created_by
+      WHERE ${where}
+      ORDER BY sp.created_at DESC, sp.id DESC`,
+    params
+  );
+  return rows.map(shapePayment);
+};
+
 // GET /api/advances/salary?month=YYYY-MM  (admin)
 const getPayroll = asyncHandler(async (req, res) => {
   const { month, from, to } = resolveMonth(req.query.month);
-  const [{ rows }, appInstallCommission] = await Promise.all([
+  const [{ rows }, appInstallCommission, payments] = await Promise.all([
     db.query(`${PAYROLL_SQL} ORDER BY u.full_name ASC`, [from, to]),
     readAppCommissionSetting(),
+    loadPayments(month),
   ]);
-  sendSuccess(res, { month, from, to, app_install_commission: appInstallCommission, items: rows.map(shapePayroll) });
+  sendSuccess(res, {
+    month, from, to,
+    app_install_commission: appInstallCommission,
+    items: rows.map(shapePayroll),
+    payments,
+  });
 });
 
 // GET /api/advances/salary/me?month=YYYY-MM  (cashier)
@@ -592,9 +650,12 @@ const getMyPayroll = asyncHandler(async (req, res) => {
     throw AppError.forbidden('Only cashiers can view their own salary.', 'INSUFFICIENT_ROLE');
   }
   const { month, from, to } = resolveMonth(req.query.month);
-  const { rows } = await db.query(`${PAYROLL_SQL} AND u.id = $3`, [from, to, req.user.id]);
+  const [{ rows }, payments] = await Promise.all([
+    db.query(`${PAYROLL_SQL} AND u.id = $3`, [from, to, req.user.id]),
+    loadPayments(month, req.user.id),
+  ]);
   if (!rows[0]) throw AppError.notFound('Cashier not found.', 'CASHIER_NOT_FOUND');
-  sendSuccess(res, { month, ...shapePayroll(rows[0]) });
+  sendSuccess(res, { month, ...shapePayroll(rows[0]), payments });
 });
 
 // PUT /api/advances/salary/base  (admin) — adds a new base-salary entry
@@ -669,7 +730,165 @@ const updatePayrollSettings = asyncHandler(async (req, res) => {
   sendSuccess(res, { app_install_commission: amount }, 200, 'Settings saved.');
 });
 
+// POST /api/advances/salary/payments  (admin)
+// { cashier_id, month: 'YYYY-MM', amount, deduct_advance?: boolean, note? }
+// Pays (part of) a cashier's salary OUT of the cashier's store register:
+//   • writes a manual 'out' entry in register_ledger (so the register balance goes down),
+//   • optionally deducts the cashier's outstanding advance from the salary (a 'repayment' row, no cash moves),
+//   • records the payment in salary_payments so the cashier can see it.
+const createSalaryPayment = asyncHandler(async (req, res) => {
+  const cashierId = parsePositiveInt(req.body.cashier_id, 'cashier_id');
+  const { month, from, to } = resolveMonth(req.body.month);
+  if (month > resolveMonth().month) {
+    throw AppError.badRequest('You cannot pay the salary of a future month.', 'VALIDATION_ERROR');
+  }
+  const amount = parseAdvanceAmount(req.body.amount);
+  const deduct = req.body.deduct_advance === true;
+  const note   = parseNote(req.body.note);
+
+  const result = await db.withTransaction(async (client) => {
+    const { rows: userRows } = await client.query(
+      `SELECT id, full_name, role, is_active, store_id FROM users WHERE id = $1`, [cashierId]
+    );
+    const cashier = userRows[0];
+    if (!cashier || cashier.role !== 'cashier' || cashier.is_active !== true) {
+      throw AppError.notFound('Cashier not found.', 'CASHIER_NOT_FOUND');
+    }
+    if (!cashier.store_id) {
+      throw AppError.badRequest('This cashier has no store, so there is no register to pay from.', 'NO_STORE');
+    }
+
+    // Same lock the register ledger uses: payments and manual entries of one store never run at the same time.
+    await lockStore(client, cashier.store_id);
+
+    const { rows: payRows } = await client.query(`${PAYROLL_SQL} AND u.id = $3`, [from, to, cashierId]);
+    const payroll = payRows[0] ? shapePayroll(payRows[0]) : null;
+    if (!payroll) throw AppError.notFound('Cashier not found.', 'CASHIER_NOT_FOUND');
+
+    if (payroll.remaining_salary <= 0) {
+      throw AppError.badRequest('This salary is already fully paid for this month.', 'NOTHING_DUE');
+    }
+
+    const deduction = deduct ? payroll.advance_deductible : 0;
+    const maxCash   = round2(payroll.remaining_salary - deduction);
+    if (amount > maxCash + 0.001) {
+      throw AppError.badRequest(
+        'The payment is higher than the salary still due.',
+        'PAYMENT_EXCEEDS_DUE'
+      ).withDetails({ max_amount: maxCash });
+    }
+
+    const balance = await storeBalance(client, cashier.store_id);
+    if (amount > balance + 0.001) {
+      throw AppError.badRequest(
+        `Not enough cash in this register: only ${balance.toFixed(2)} DZD available.`,
+        'INSUFFICIENT_REGISTER_CASH'
+      ).withDetails({ current_balance: balance });
+    }
+
+    const description = `Salary payment — ${cashier.full_name} (${month})`;
+    const { rows: ledgerRows } = await client.query(
+      `INSERT INTO register_ledger
+         (store_id, user_id, source, direction, entry_date, description, total_amount, created_by)
+       VALUES ($1, $2, 'manual', 'out', CURRENT_DATE, $3, $4, $2)
+       RETURNING id`,
+      [cashier.store_id, req.user.id, description, amount]
+    );
+
+    let repaymentId = null;
+    if (deduction > 0) {
+      const { rows: repRows } = await client.query(
+        `INSERT INTO cashier_advances (cashier_id, session_id, direction, amount, note, created_by)
+         VALUES ($1, NULL, 'repayment', $2, $3, $4)
+         RETURNING id`,
+        [cashierId, deduction, `Deducted from ${month} salary`, req.user.id]
+      );
+      repaymentId = repRows[0].id;
+    }
+
+    const { rows: spRows } = await client.query(
+      `INSERT INTO salary_payments
+         (cashier_id, store_id, month, amount, advance_deducted, note, ledger_id, repayment_id, created_by)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+       RETURNING id`,
+      [cashierId, cashier.store_id, month, amount, deduction, note, ledgerRows[0].id, repaymentId, req.user.id]
+    );
+
+    return {
+      id: spRows[0].id, ledger_id: ledgerRows[0].id, repayment_id: repaymentId,
+      cashier_id: cashierId, cashier_name: cashier.full_name, store_id: cashier.store_id,
+      month, amount, advance_deducted: deduction,
+      remaining_salary: round2(payroll.remaining_salary - amount - deduction),
+      register_balance_after: round2(balance - amount),
+    };
+  });
+
+  audit({
+    userId: req.user.id, action: 'INSERT', table: 'salary_payments', recordId: result.id,
+    newValues: {
+      cashier_id: cashierId, month, amount, advance_deducted: result.advance_deducted,
+      ledger_id: result.ledger_id, store_id: result.store_id,
+    },
+    description: 'salary_payment', ip: req.clientIp,
+  });
+
+  sendCreated(res, result, 'Salary payment recorded.');
+});
+
+// POST /api/advances/salary/payments/:id/void  (admin) { reason }
+// Puts the money back in the register and re-opens the deducted advance.
+const voidSalaryPayment = asyncHandler(async (req, res) => {
+  const id = parseId(req.params.id, 'id');
+  const reason = validateVoidReason(req.body.reason !== undefined ? req.body.reason : req.body.void_reason);
+
+  // Lock the store BEFORE the payment row (same order as everywhere else → no deadlocks).
+  const { rows: pre } = await db.query(`SELECT store_id FROM salary_payments WHERE id = $1`, [id]);
+  if (!pre[0]) throw AppError.notFound('Salary payment not found.', 'PAYMENT_NOT_FOUND');
+
+  const updated = await db.withTransaction(async (client) => {
+    await lockStore(client, pre[0].store_id);
+
+    const { rows } = await client.query(`SELECT * FROM salary_payments WHERE id = $1 FOR UPDATE`, [id]);
+    const row = rows[0];
+    if (!row) throw AppError.notFound('Salary payment not found.', 'PAYMENT_NOT_FOUND');
+    if (row.is_voided) throw AppError.conflict('This salary payment is already voided.', 'ALREADY_VOIDED');
+
+    await client.query(
+      `UPDATE register_ledger
+          SET is_voided = TRUE, voided_at = NOW(), voided_by = $1, void_reason = $2
+        WHERE id = $3 AND is_voided = FALSE`,
+      [req.user.id, reason, row.ledger_id]
+    );
+    if (row.repayment_id) {
+      await client.query(
+        `UPDATE cashier_advances
+            SET is_voided = TRUE, voided_at = NOW(), voided_by = $1, void_reason = $2
+          WHERE id = $3 AND is_voided = FALSE`,
+        [req.user.id, reason, row.repayment_id]
+      );
+    }
+    const { rows: out } = await client.query(
+      `UPDATE salary_payments
+          SET is_voided = TRUE, voided_at = NOW(), voided_by = $1, void_reason = $2
+        WHERE id = $3
+        RETURNING id, is_voided, voided_at, voided_by`,
+      [req.user.id, reason, id]
+    );
+    return out[0];
+  });
+
+  audit({
+    userId: req.user.id, action: 'VOID', table: 'salary_payments', recordId: id,
+    oldValues: { is_voided: false }, newValues: { is_voided: true, void_reason: reason },
+    description: 'salary_payment', ip: req.clientIp,
+  });
+
+  sendSuccess(res, updated, 200, 'Salary payment voided.');
+});
+
 module.exports = {
+  createSalaryPayment,
+  voidSalaryPayment,
   createAdvance,
   createRepayment,
   getMyAdvances,

@@ -7,27 +7,10 @@ const { audit } = require('../utils/audit');
 const {
   requireFields, parseId, parseString, parsePagination, validateAmount, validateVoidReason,
 } = require('../utils/validators');
-const { buildFilters } = require('../utils/registerLedger');
+const { buildFilters, storeBalance, lockStore } = require('../utils/registerLedger');
 
 const num = (v) => parseFloat(v) || 0;
 const fmt = (n) => `${n.toFixed(2)} DZD`;
-
-/** Money currently in a store's register = active "in" − active "out". Call inside a store-locked transaction. */
-const storeBalance = async (client, storeId) => {
-  const { rows } = await client.query(
-    `SELECT COALESCE(SUM(CASE WHEN direction = 'in' THEN total_amount ELSE -total_amount END), 0) AS balance
-       FROM register_ledger
-      WHERE store_id = $1 AND is_voided = FALSE`,
-    [storeId]
-  );
-  return num(rows[0].balance);
-};
-
-// Serialises every money movement of one store (manual entries and voids).
-const lockStore = async (client, storeId) => {
-  const { rows } = await client.query(`SELECT id FROM stores WHERE id = $1 FOR UPDATE`, [storeId]);
-  if (!rows[0]) throw AppError.notFound('Store not found.', 'STORE_NOT_FOUND');
-};
 
 // GET /api/register-ledger/filters — options for the dropdowns (+ current balance per store)
 const getFilters = asyncHandler(async (req, res) => {
@@ -67,7 +50,7 @@ const listLedger = asyncHandler(async (req, res) => {
       `SELECT l.id, l.store_id, st.name AS store_name, l.user_id, u.full_name AS user_name,
               l.session_id, l.source, l.direction, to_char(l.entry_date, 'YYYY-MM-DD') AS entry_date,
               l.description, l.total_amount, l.sim_amount, l.storm_amount, l.product_amount,
-              l.debts_amount, l.expenses_amount, l.card_amount,
+              l.debts_amount, l.expenses_amount,
               l.is_voided, l.voided_at, vu.full_name AS voided_by_name, l.void_reason, l.created_at
          FROM register_ledger l
          JOIN stores st ON st.id = l.store_id
@@ -99,7 +82,6 @@ const listLedger = asyncHandler(async (req, res) => {
       product_amount: num(r.product_amount),
       debts_amount: num(r.debts_amount),
       expenses_amount: num(r.expenses_amount),
-      card_amount: num(r.card_amount),
     })),
     total: countRows[0].total,
     limit,
@@ -169,6 +151,17 @@ const voidEntry = asyncHandler(async (req, res) => {
     const row = rows[0];
     if (!row) throw AppError.notFound('Entry not found.', 'ENTRY_NOT_FOUND');
     if (row.is_voided) throw AppError.conflict('This entry is already voided.', 'ALREADY_VOIDED');
+
+    // A salary payment must be voided from Payroll & Advances, otherwise it would stay "paid" with no money behind it.
+    const { rows: linked } = await client.query(
+      `SELECT id FROM salary_payments WHERE ledger_id = $1 AND is_voided = FALSE`, [id]
+    );
+    if (linked[0]) {
+      throw AppError.conflict(
+        'This entry is a salary payment. Void it from Payroll & Advances instead.',
+        'LINKED_TO_SALARY_PAYMENT'
+      );
+    }
 
     await client.query(
       `UPDATE register_ledger SET is_voided = TRUE, voided_at = NOW(), voided_by = $1, void_reason = $2 WHERE id = $3`,

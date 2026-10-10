@@ -7,8 +7,24 @@ const { parseId, parseDateTime } = require('./validators');
 //   true  → total = SIM + Storm + Products − debts − register expenses
 //           (the cash that should really be in the drawer; debts are unpaid, expenses were paid out of it)
 //   false → total = SIM + Storm + Products (debts and expenses are only recorded, not deducted)
-// Card (TPE) payments are ALWAYS deducted: the sale happened but no cash came into the drawer.
 const NET_OF_DEBTS_AND_EXPENSES = true;
+
+/** Money currently in a store's register = active "in" − active "out". Call inside a store-locked transaction. */
+const storeBalance = async (client, storeId) => {
+  const { rows } = await client.query(
+    `SELECT COALESCE(SUM(CASE WHEN direction = 'in' THEN total_amount ELSE -total_amount END), 0) AS balance
+       FROM register_ledger
+      WHERE store_id = $1 AND is_voided = FALSE`,
+    [storeId]
+  );
+  return parseFloat(rows[0].balance) || 0;
+};
+
+// Serialises every money movement of one store (manual entries, salary payments and voids).
+const lockStore = async (client, storeId) => {
+  const { rows } = await client.query(`SELECT id FROM stores WHERE id = $1 FOR UPDATE`, [storeId]);
+  if (!rows[0]) throw AppError.notFound('Store not found.', 'STORE_NOT_FOUND');
+};
 
 /**
  * Writes the "money collected" entry for a closed session.
@@ -28,8 +44,7 @@ const recordSessionCollection = async (client, sessionId, createdBy) => {
               ROUND(COALESCE(storm.amount, 0), 2) AS storm_amount,
               ROUND(COALESCE(prod.amount,  0), 2) AS product_amount,
               ROUND(COALESCE(de.amount,    0), 2) AS debts_amount,
-              ROUND(COALESCE(ex.amount,    0), 2) AS expenses_amount,
-              ROUND(COALESCE(cp.amount,    0), 2) AS card_amount
+              ROUND(COALESCE(ex.amount,    0), 2) AS expenses_amount
          FROM cashier_sessions cs
          JOIN users  u  ON u.id  = cs.cashier_id
          JOIN stores st ON st.id = cs.store_id
@@ -54,22 +69,17 @@ const recordSessionCollection = async (client, sessionId, createdBy) => {
            SELECT SUM(x.amount) AS amount
              FROM register_expenses x WHERE x.session_id = cs.id AND x.is_voided = FALSE
          ) ex ON TRUE
-         LEFT JOIN LATERAL (
-           SELECT SUM(x.amount) AS amount
-             FROM session_card_payments x WHERE x.session_id = cs.id AND x.is_voided = FALSE
-         ) cp ON TRUE
         WHERE cs.id = $1
      )
      INSERT INTO register_ledger
        (store_id, user_id, session_id, source, direction, entry_date, description,
-        total_amount, sim_amount, storm_amount, product_amount, debts_amount, expenses_amount, card_amount,
+        total_amount, sim_amount, storm_amount, product_amount, debts_amount, expenses_amount,
         created_by, created_at)
      SELECT c.store_id, c.cashier_id, c.session_id, 'session', 'in', c.session_date,
             'Daily closing — ' || c.cashier_name || ' (' || c.store_name || ')',
             c.sim_amount + c.storm_amount + c.product_amount
-              - CASE WHEN $3::boolean THEN c.debts_amount + c.expenses_amount ELSE 0 END
-              - c.card_amount,
-            c.sim_amount, c.storm_amount, c.product_amount, c.debts_amount, c.expenses_amount, c.card_amount,
+              - CASE WHEN $3::boolean THEN c.debts_amount + c.expenses_amount ELSE 0 END,
+            c.sim_amount, c.storm_amount, c.product_amount, c.debts_amount, c.expenses_amount,
             $2, COALESCE(c.closed_at, NOW())
        FROM calc c
      ON CONFLICT (session_id) WHERE source = 'session' AND is_voided = FALSE DO NOTHING
@@ -77,87 +87,6 @@ const recordSessionCollection = async (client, sessionId, createdBy) => {
     [sessionId, createdBy, NET_OF_DEBTS_AND_EXPENSES]
   );
   return rows[0] || null;
-};
-
-// ─── Live register cash (used by the expenses module) ────────────────────────
-
-const toNum = (v) => parseFloat(v) || 0;
-const round2 = (n) => Math.round((n + Number.EPSILON) * 100) / 100;
-
-/** Serialises every money movement of one store (manual entries, voids, expenses). */
-const lockStore = async (client, storeId) => {
-  const { rows } = await client.query(`SELECT id FROM stores WHERE id = $1 FOR UPDATE`, [storeId]);
-  if (!rows[0]) throw AppError.notFound('Store not found.', 'STORE_NOT_FOUND');
-};
-
-/** Money already in a store's register = active "in" − active "out" (closed sessions + manual entries). */
-const storeLedgerBalance = async (client, storeId) => {
-  const { rows } = await client.query(
-    `SELECT COALESCE(SUM(CASE WHEN direction = 'in' THEN total_amount ELSE -total_amount END), 0) AS balance
-       FROM register_ledger
-      WHERE store_id = $1 AND is_voided = FALSE`,
-    [storeId]
-  );
-  return round2(toNum(rows[0].balance));
-};
-
-/**
- * What an OPEN session has put in the drawer so far (same maths as recordSessionCollection,
- * but computed live because the session has not been closed / written to the ledger yet).
- */
-const sessionLiveTakings = async (client, sessionId) => {
-  const { rows } = await client.query(
-    `WITH pt AS (
-       SELECT COALESCE((SELECT value::numeric FROM loyalty_settings WHERE key = 'point_to_dzd_value'), 1) AS v
-     )
-     SELECT
-       COALESCE((SELECT SUM(x.selling_price_snapshot - COALESCE(x.loyalty_redeemed_snapshot, 0) * pt.v)
-                   FROM session_sim_sales x CROSS JOIN pt
-                  WHERE x.session_id = $1 AND x.is_voided = FALSE), 0) AS sim_amount,
-       COALESCE((SELECT SUM(x.amount - COALESCE(x.loyalty_redeemed_snapshot, 0) * pt.v)
-                   FROM session_storm_entries x CROSS JOIN pt
-                  WHERE x.session_id = $1 AND x.is_voided = FALSE), 0) AS storm_amount,
-       COALESCE((SELECT SUM(x.price_snapshot - COALESCE(x.loyalty_redeemed_snapshot, 0) * pt.v)
-                   FROM session_accessory_sales x CROSS JOIN pt
-                  WHERE x.session_id = $1 AND x.is_voided = FALSE), 0) AS product_amount,
-       COALESCE((SELECT SUM(x.amount) FROM session_debts x
-                  WHERE x.session_id = $1 AND x.is_voided = FALSE), 0) AS debts_amount,
-       COALESCE((SELECT SUM(x.amount) FROM register_expenses x
-                  WHERE x.session_id = $1 AND x.is_voided = FALSE), 0) AS expenses_amount,
-       COALESCE((SELECT SUM(x.amount) FROM session_card_payments x
-                  WHERE x.session_id = $1 AND x.is_voided = FALSE), 0) AS card_amount`,
-    [sessionId]
-  );
-  const r = rows[0];
-  const sales    = round2(toNum(r.sim_amount) + toNum(r.storm_amount) + toNum(r.product_amount));
-  const debts    = round2(toNum(r.debts_amount));
-  const expenses = round2(toNum(r.expenses_amount));
-  const card     = round2(toNum(r.card_amount));
-  const net      = round2(sales - (NET_OF_DEBTS_AND_EXPENSES ? debts + expenses : 0) - card);
-  return { sales, debts, expenses, card, net };
-};
-
-/**
- * Cash a person can spend from the register right now.
- *   cashier (sessionId given): money already in the store register + what his open session sold so far
- *   admin   (sessionId null) : money already in the store register
- */
-const getRegisterCash = async (client, storeId, sessionId = null) => {
-  const storeBalance = await storeLedgerBalance(client, storeId);
-  const live = sessionId
-    ? await sessionLiveTakings(client, sessionId)
-    : { sales: 0, debts: 0, expenses: 0, card: 0, net: 0 };
-  return {
-    store_id: storeId,
-    session_id: sessionId,
-    store_balance: storeBalance,        // already collected in the ledger (previous closed sessions − admin withdrawals)
-    session_sales: live.sales,          // SIM + Storm + Products sold in the open session (after loyalty points)
-    session_debts: live.debts,
-    session_expenses: live.expenses,
-    session_card: live.card,            // paid by credit card (TPE): sold but no cash received
-    session_net: live.net,              // "money made by selling items" in the register today
-    available: round2(Math.max(0, storeBalance + live.net)),
-  };
 };
 
 const STATUS1 = ['all', 'active', 'void'];
@@ -206,7 +135,4 @@ const buildFilters = (query = {}) => {
   return { params, scopeConds: scope, scopeWhere: whereOf(scope), rowWhere: whereOf(rows) };
 };
 
-module.exports = {
-  NET_OF_DEBTS_AND_EXPENSES, recordSessionCollection, buildFilters,
-  lockStore, storeLedgerBalance, sessionLiveTakings, getRegisterCash,
-};
+module.exports = { NET_OF_DEBTS_AND_EXPENSES, recordSessionCollection, buildFilters, storeBalance, lockStore };

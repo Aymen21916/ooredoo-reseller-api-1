@@ -6,7 +6,11 @@ const logger   = require('../utils/logger');
 const { asyncHandler, sendSuccess, sendCreated } = require('../utils/asyncHandler');
 const { audit } = require('../utils/audit');
 const { parseDate, parseId, validateDateRange } = require('../utils/validators');
-const { manualRechargesByMonth, monthKey } = require('../utils/manualLedger');
+const { getPrelevementForRange } = require('../utils/prelevement');
+
+// The nightly cash sweep (financesController cron) is stored in register_expenses but it is a
+// cash collection, NOT a business expense. It must never be counted as an expense.
+const SWEEP_DESC_PREFIX = 'Automatic Daily Cash Collection%';
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -37,13 +41,6 @@ const validateReportDate = (raw) => {
     throw AppError.badRequest('Cannot generate a report for a future date.', 'FUTURE_DATE');
   }
   return date;
-};
-
-const calculatePrelevement = (amount) => {
-  if (amount <= 700000) return amount * 0.025;
-  if (amount <= 1200000) return 17500 + (amount - 700000) * 0.03;
-  if (amount <= 1800000) return 32500 + (amount - 1200000) * 0.035;
-  return 52500 + (amount - 1800000) * 0.04;
 };
 
 const mapSession = (row) => ({
@@ -159,13 +156,12 @@ const previewDailyReport = asyncHandler(async (req, res) => {
   }
 
   const stores_summary = Array.from(storeMap.values()).map((s) => {
-    const prelevement = (s.total_real_price + s.total_storm) * 0.025; 
     return {
       ...s,
       loyalty_discount_dzd: s.loyalty_points_redeemed * ptVal,
       total_revenue: s.total_selling_price + s.total_storm + s.total_accessories,
-      // PURE GROSS PROFIT MATH: No expenses subtracted
-      gross_profit: s.total_sim_profit + s.total_accessories_profit + prelevement,
+      // PROFIT = SIM profit + product profit (Prélèvement is global, see `prelevement` below)
+      gross_profit: s.total_sim_profit + s.total_accessories_profit,
     };
   });
 
@@ -173,8 +169,12 @@ const previewDailyReport = asyncHandler(async (req, res) => {
   const closed_sessions  = allSessions.filter((s) => s.status === 'closed');
   const generatable_stores = stores_summary.filter((s) => !s.already_generated && s.sessions_included > 0);
 
+  // Prélèvement = tiered calculation on the manual recharges (getManualLedger) of that day.
+  const prelevementInfo = await getPrelevementForRange(date, date);
+
   sendSuccess(res, {
-    date, today: todayStr(), open_sessions, closed_sessions: closed_sessions.length, blocking_open_sessions: open_sessions.length,
+    date, today: todayStr(),
+    manual_recharges: prelevementInfo.manual_recharges, prelevement: prelevementInfo.prelevement, open_sessions, closed_sessions: closed_sessions.length, blocking_open_sessions: open_sessions.length,
     stores_summary, can_generate: generatable_stores.length > 0, generatable_count: generatable_stores.length,
     already_generated_count: stores_summary.filter((s) => s.already_generated).length,
   });
@@ -246,9 +246,8 @@ const generateDailyReport = asyncHandler(async (req, res) => {
         return { ...mapSession(s), sim_sales: simBySession.get(s.session_id) || [], storm_entries: stormBySession.get(s.session_id) || [], accessory_sales: accBySession.get(s.session_id) || [], debts: debtBySession.get(s.session_id) || [] };
       });
 
-      const prelevement = (total_real_price + total_storm) * 0.025; 
-      // PURE GROSS PROFIT MATH
-      const gross_profit = total_sim_profit + total_accessory_profit + prelevement;
+      // PROFIT = SIM profit + product profit
+      const gross_profit = total_sim_profit + total_accessory_profit;
 
       const { rows: registerRows } = await client.query(`SELECT cash_amount, updated_at FROM store_register_state WHERE store_id = $1 ORDER BY id DESC LIMIT 1`, [storeId]);
       const register = registerRows[0] || { cash_amount: 0 };
@@ -311,7 +310,7 @@ const ZERO_METRICS = () => ({
   storm_total: 0, prelevement: 0, accessories_total_selling: 0, accessories_total_real: 0, accessories_total_commission: 0,
   debt_total: 0, cashier_advance_total: 0, cashier_repayment_total: 0, register_expense_total: 0,
   register_expense_by_category: { utility: 0, inventory: 0, other: 0 },
-  sim_profit: 0, accessory_profit: 0, gross_profit: 0, loyalty_points_redeemed: 0, loyalty_discount_dzd: 0, loyalty_driven_revenue: 0,
+  sim_profit: 0, accessory_profit: 0, gross_profit: 0, net_profit: 0, manual_recharges: 0, loyalty_points_redeemed: 0, loyalty_discount_dzd: 0, loyalty_driven_revenue: 0,
 });
 
 const accumulate = (dst, src) => {
@@ -327,15 +326,16 @@ const accumulate = (dst, src) => {
 const finalizeProfit = (m) => {
   m.sim_profit = m.sim_total_points + m.sim_total_selling_price - m.sim_total_real_price;
   m.accessory_profit = m.accessories_total_selling - m.accessories_total_real;
-  // PURE GROSS PROFIT MATH: No expenses subtracted
-  m.gross_profit = m.sim_profit + m.accessory_profit + (m.prelevement || 0);
+  // PROFIT = SIM profit + product profit (no expenses, no Prélèvement)
+  m.gross_profit = m.sim_profit + m.accessory_profit;
+  // Informational: profit + Prélèvement (global, manual recharges) - real expenses
+  m.net_profit = m.gross_profit + (m.prelevement || 0) - (m.register_expense_total || 0);
 };
 
 const getDateRangeReport = asyncHandler(async (req, res) => {
   const { from, to } = validateDateRange(req.query.from, req.query.to);
   const isAdmin   = req.user.role === 'admin';
   const cashierId = isAdmin ? null : req.user.id;
-  const rangeDays = daysBetween(from, to);
   const ptVal = await getPtVal();
 
   const cellsSql = `
@@ -363,55 +363,18 @@ const getDateRangeReport = asyncHandler(async (req, res) => {
      ORDER BY u.full_name NULLS LAST, st.name NULLS LAST
   `;
 
-  const prelevementMonthlySql = `WITH combined AS (SELECT cs.cashier_id, cs.store_id, DATE_TRUNC('month', se.entered_at)::date AS month, se.amount AS base_amount FROM session_storm_entries se JOIN cashier_sessions cs ON cs.id = se.session_id WHERE se.is_voided = FALSE AND se.entered_at::date BETWEEN $1 AND $2 AND ($3::int IS NULL OR cs.cashier_id = $3) UNION ALL SELECT cs.cashier_id, cs.store_id, DATE_TRUNC('month', ss.sold_at)::date AS month, ss.real_price_snapshot AS base_amount FROM session_sim_sales ss JOIN cashier_sessions cs ON cs.id = ss.session_id WHERE ss.is_voided = FALSE AND ss.sold_at::date BETWEEN $1 AND $2 AND ($3::int IS NULL OR cs.cashier_id = $3)) SELECT cashier_id, store_id, month, SUM(base_amount) AS base_amount FROM combined GROUP BY cashier_id, store_id, month`;
   const advancesSql = `SELECT ca.cashier_id, u.full_name AS cashier_full_name, u.store_id AS user_store_id, COALESCE(SUM(ca.amount) FILTER (WHERE ca.direction = 'advance'), 0) AS cashier_advance_total, COALESCE(SUM(ca.amount) FILTER (WHERE ca.direction = 'repayment'), 0) AS cashier_repayment_total FROM cashier_advances ca JOIN users u ON u.id = ca.cashier_id WHERE ca.is_voided = FALSE AND ca.created_at::date BETWEEN $1 AND $2 AND ($3::int IS NULL OR ca.cashier_id = $3) GROUP BY ca.cashier_id, u.full_name, u.store_id`;
-  const expensesSql = `SELECT re.store_id, re.category, COALESCE(SUM(re.amount), 0) AS amt FROM register_expenses re WHERE re.is_voided = FALSE AND re.expense_date BETWEEN $1 AND $2 AND ($3::int IS NULL OR re.store_id IN (SELECT DISTINCT cs.store_id FROM cashier_sessions cs WHERE cs.cashier_id = $3)) GROUP BY re.store_id, re.category`;
+  const expensesSql = `SELECT re.store_id, re.category, COALESCE(SUM(re.amount), 0) AS amt FROM register_expenses re WHERE re.is_voided = FALSE AND re.expense_date BETWEEN $1 AND $2 AND COALESCE(re.description, '') NOT LIKE '${SWEEP_DESC_PREFIX}' AND ($3::int IS NULL OR re.store_id IN (SELECT DISTINCT cs.store_id FROM cashier_sessions cs WHERE cs.cashier_id = $3)) GROUP BY re.store_id, re.category`;
   const debtsSql = `SELECT sd.id, sd.session_id, sd.amount, sd.description, sd.entered_at, c.id AS customer_id, (c.first_name || ' ' || c.last_name) AS full_name, c.phone_number, c.profession FROM session_debts sd JOIN cashier_sessions cs ON cs.id = sd.session_id JOIN customers c ON c.id  = sd.customer_id WHERE sd.is_voided = FALSE AND sd.entered_at::date BETWEEN $1 AND $2 AND ($3::int IS NULL OR cs.cashier_id = $3) ORDER BY sd.entered_at DESC, sd.id DESC`;
 
   const startedAt = Date.now();
-  const [cellsRes, prelevementRes, advanceRes, expenseRes, debtRes, { rows: storesData }, manualRecharges] = await Promise.all([
-    db.query(cellsSql, [from, to, cashierId]), db.query(prelevementMonthlySql, [from, to, cashierId]), db.query(advancesSql, [from, to, cashierId]), db.query(expensesSql, [from, to, cashierId]), db.query(debtsSql, [from, to, cashierId]), db.query(`SELECT id, name FROM stores`),
-    isAdmin ? manualRechargesByMonth(from, to) : Promise.resolve({ byMonth: new Map(), total: 0 }),
+  const [cellsRes, advanceRes, expenseRes, debtRes, { rows: storesData }, prelevementInfo] = await Promise.all([
+    db.query(cellsSql, [from, to, cashierId]), db.query(advancesSql, [from, to, cashierId]), db.query(expensesSql, [from, to, cashierId]), db.query(debtsSql, [from, to, cashierId]), db.query(`SELECT id, name FROM stores`),
+    // Prélèvement: manual recharges of the Side-Ledger (global pool) -> admin scope only
+    isAdmin ? getPrelevementForRange(from, to) : Promise.resolve({ manual_recharges: 0, prelevement: 0, by_month: [] }),
   ]);
   const elapsed_ms = Date.now() - startedAt;
   const storeNameById = new Map(storesData.map((s) => [s.id, s.name]));
-
-  // Manual Side-Ledger recharges (global pool, admin scope only) are part of the Prélèvement base.
-  const manualRechargeTotal = manualRecharges.total;
-
-  // Prélèvement base (Storm + SIM cost) per month over ALL cashiers/stores.
-  // Used to share the manual recharges out to individual stores/cashiers.
-  const baseByMonth = new Map();
-  for (const row of prelevementRes.rows) {
-    const k = monthKey(row.month);
-    baseByMonth.set(k, (baseByMonth.get(k) || 0) + (parseFloat(row.base_amount) || 0));
-  }
-  const periodBase = Array.from(baseByMonth.values()).reduce((s, b) => s + b, 0);
-
-  // A slice's share of the manual recharges in the flat (1-day) case.
-  const flatManualShare = (sliceBase) => (periodBase > 0 ? manualRechargeTotal * (sliceBase / periodBase) : 0);
-
-  // manualMode: 'none' | 'all' (full manual amount: global totals) | 'share' (proportional to the slice's base)
-  const getTieredPrelevement = (targetCashierId, targetStoreId, manualMode = 'none') => {
-    const monthlyTotals = new Map();
-    for (const row of prelevementRes.rows) {
-      if (targetCashierId && row.cashier_id !== targetCashierId) continue;
-      if (targetStoreId && row.store_id !== targetStoreId) continue;
-      const k = monthKey(row.month);
-      monthlyTotals.set(k, (monthlyTotals.get(k) || 0) + (parseFloat(row.base_amount) || 0));
-    }
-    if (manualMode !== 'none') {
-      for (const [k, manualAmt] of manualRecharges.byMonth) {
-        const mine = monthlyTotals.get(k) || 0;
-        const whole = baseByMonth.get(k) || 0;
-        const extra = manualMode === 'all' ? manualAmt : (whole > 0 ? manualAmt * (mine / whole) : 0);
-        monthlyTotals.set(k, mine + extra);
-      }
-    }
-    let totalPrelevement = 0;
-    for (const amt of monthlyTotals.values()) totalPrelevement += calculatePrelevement(amt);
-    return totalPrelevement;
-  };
 
   const expensesByStore = new Map();
   for (const e of expenseRes.rows) {
@@ -456,9 +419,7 @@ const getDateRangeReport = asyncHandler(async (req, res) => {
       for (const [sid, n] of c.cell_store_counts) { if (n > bestCount) { best = sid; bestCount = n; } }
       primaryStore = best;
     }
-    c.metrics.prelevement = rangeDays === 1
-      ? ((c.metrics.storm_total + c.metrics.sim_total_real_price) + flatManualShare(c.metrics.storm_total + c.metrics.sim_total_real_price)) * 0.025
-      : getTieredPrelevement(c.cashier_id, null, 'share');
+    // Prélèvement is global (manual recharges are not tied to a cashier) -> not attributed here.
     finalizeProfit(c.metrics);
     return { cashier_id: c.cashier_id, cashier_full_name: c.cashier_full_name, store_id: primaryStore, store_name: primaryStore != null ? (storeNameById.get(primaryStore) || null) : null, ...c.metrics };
   });
@@ -472,9 +433,7 @@ const getDateRangeReport = asyncHandler(async (req, res) => {
       const s = ensureStore(sid); s.metrics.register_expense_total += bucket.total; s.metrics.register_expense_by_category.utility += bucket.utility || 0; s.metrics.register_expense_by_category.inventory += bucket.inventory || 0; s.metrics.register_expense_by_category.other += bucket.other || 0;
     }
     per_store = Array.from(storeMap.values()).map((s) => {
-        s.metrics.prelevement = rangeDays === 1
-          ? ((s.metrics.storm_total + s.metrics.sim_total_real_price) + flatManualShare(s.metrics.storm_total + s.metrics.sim_total_real_price)) * 0.025
-          : getTieredPrelevement(null, s.store_id, 'share');
+        // Prélèvement is global (manual recharges are not tied to a store) -> not attributed here.
         finalizeProfit(s.metrics);
         return { store_id: s.store_id, store_name: s.store_name, ...s.metrics };
     }).sort((a, b) => (a.store_id || 0) - (b.store_id || 0));
@@ -485,8 +444,8 @@ const getDateRangeReport = asyncHandler(async (req, res) => {
   for (const a of advancesByCashier.values()) { totals.cashier_advance_total += a.advance_total; totals.cashier_repayment_total += a.repayment_total; }
   for (const bucket of expensesByStore.values()) { totals.register_expense_total += bucket.total; totals.register_expense_by_category.utility += bucket.utility || 0; totals.register_expense_by_category.inventory += bucket.inventory || 0; totals.register_expense_by_category.other += bucket.other || 0; }
   
-  totals.manual_recharges = manualRechargeTotal;
-  totals.prelevement = rangeDays === 1 ? (totals.storm_total + totals.sim_total_real_price + manualRechargeTotal) * 0.025 : getTieredPrelevement(null, null, 'all');
+  totals.manual_recharges = prelevementInfo.manual_recharges;
+  totals.prelevement = prelevementInfo.prelevement;
   finalizeProfit(totals);
 
   const debts = debtRes.rows.map((d) => ({ id: d.id, session_id: d.session_id, amount: parseFloat(d.amount) || 0, description: d.description, created_at: d.entered_at, customer: { id: d.customer_id, full_name: d.full_name, phone_number: d.phone_number, profession: d.profession } }));
@@ -494,6 +453,7 @@ const getDateRangeReport = asyncHandler(async (req, res) => {
 
   const payload = {
     from, to, scope: isAdmin ? 'admin' : 'cashier', elapsed_ms, totals, per_cashier, debts, advances,
+    prelevement_by_month: prelevementInfo.by_month,
     expenses_by_category: { utility: totals.register_expense_by_category.utility, inventory: totals.register_expense_by_category.inventory, other: totals.register_expense_by_category.other },
   };
   if (isAdmin) payload.per_store = per_store;
@@ -601,7 +561,7 @@ const getMonthlySummary = asyncHandler(async (req, res) => {
   if (req.query.store_id) { rowParams.push(parseId(req.query.store_id, 'store_id')); conditions.push(`store_id = $${rowParams.length}`); }
   const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
 
-  const [{ rows }, { rows: baseRows }, manualRecharges] = await Promise.all([
+  const [{ rows }, prelevementInfo] = await Promise.all([
     db.query(
       `SELECT v.month, v.store_id, s.name AS store_name,
               v.total_sim_units, v.total_selling_price, v.total_real_price,
@@ -612,31 +572,23 @@ const getMonthlySummary = asyncHandler(async (req, res) => {
          JOIN stores s ON s.id = v.store_id
          ${where} ORDER BY v.month DESC, v.store_id ASC`, rowParams
     ),
-    // Prélèvement base of ALL stores per month (ignores the store filter) to share the manual recharges out
-    db.query(
-      `SELECT month, SUM(total_storm + total_real_price) AS base
-         FROM v_monthly_summary ${monthWhere} GROUP BY month`, params
-    ),
-    manualRechargesByMonth(fromD, toD, { wholeMonths: true }),
+    // Prélèvement = tiered calculation on the manual recharges (getManualLedger) of each whole month
+    getPrelevementForRange(fromD, toD, { wholeMonths: true }),
   ]);
 
-  const wholeBaseByMonth = new Map(baseRows.map((b) => [monthKey(b.month), parseFloat(b.base) || 0]));
+  const prelevementByMonth = new Map(prelevementInfo.by_month.map((m) => [m.month, m]));
 
   const decorated = rows.map((r) => {
     const revenue = (parseFloat(r.total_selling_price) || 0) + (parseFloat(r.total_storm) || 0) + (parseFloat(r.total_accessories) || 0);
-    const base_amount = (parseFloat(r.total_storm) || 0) + (parseFloat(r.total_real_price) || 0);
 
-    // This store's share of the manual recharges added in that month
-    const k = monthKey(r.month);
-    const whole = wholeBaseByMonth.get(k) || 0;
-    const manualMonth = manualRecharges.byMonth.get(k) || 0;
-    const manualShare = whole > 0 ? manualMonth * (base_amount / whole) : 0;
-
-    const tieredPrelevement = calculatePrelevement(base_amount + manualShare);
-
-    // PURE GROSS PROFIT MATH for monthly
-    const profit = (parseFloat(r.gross_profit) || 0) + tieredPrelevement;
+    // The view's gross_profit already = SIM profit + product profit. Prélèvement is GLOBAL per month
+    // (not per store) so it is exposed as informational fields, never added to the store profit.
+    const profit = parseFloat(r.gross_profit) || 0;
     const loyaltyPts = parseFloat(r.loyalty_points_redeemed) || 0;
+    const monthKeyStr = r.month instanceof Date
+      ? `${r.month.getFullYear()}-${String(r.month.getMonth() + 1).padStart(2, '0')}` // local parts: a DATE comes back as local midnight
+      : String(r.month).slice(0, 7);
+    const pm = prelevementByMonth.get(monthKeyStr);
 
     return {
       ...r,
@@ -644,7 +596,8 @@ const getMonthlySummary = asyncHandler(async (req, res) => {
       loyalty_discount_dzd: loyaltyPts * ptVal,
       loyalty_driven_revenue: parseFloat(r.loyalty_driven_revenue) || 0,
       total_revenue: revenue,
-      manual_recharges_share: manualShare,
+      month_manual_recharges: pm ? pm.manual_recharges : 0,
+      month_prelevement: pm ? pm.prelevement : 0,
       gross_profit:  profit,
       margin_pct:    revenue > 0 ? (profit / revenue) * 100 : 0,
     };
@@ -708,7 +661,7 @@ const getTopRollup = asyncHandler(async (req, res) => {
 const getCashierHistory = asyncHandler(async (req, res) => {
   const cashierId = parseId(req.params.id);
   const today = todayStr();
-  const defaultFrom = (() => { const d = new Date(); d.setMonth(d.getMonth() - 3); return d.toISOString().slice(0, 10); })();
+  const defaultFrom = (() => { const d = new Date(); d.setMonth(d.getMonth() - 3); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`; })();
   const from = req.query.from ? parseDate(req.query.from, 'from') : defaultFrom;
   const to   = req.query.to   ? parseDate(req.query.to,   'to')   : today;
   if (from > to) throw AppError.badRequest('"to" must be on or after "from".', 'INVALID_DATE_RANGE');
@@ -762,24 +715,6 @@ const getCashierHistory = asyncHandler(async (req, res) => {
        FROM cashier_advances WHERE cashier_id = $1`, [cashierId]
   );
 
-  const rangeDays = daysBetween(from, to);
-  const [{ rows: prelevementMonths }, manualRecharges] = await Promise.all([
-    db.query(
-      `WITH combined AS (
-         SELECT cs.cashier_id, DATE_TRUNC('month', se.entered_at)::date AS month, se.amount AS base_amount
-           FROM session_storm_entries se JOIN cashier_sessions cs ON cs.id = se.session_id
-          WHERE se.is_voided = FALSE AND cs.session_date BETWEEN $1 AND $2
-         UNION ALL
-         SELECT cs.cashier_id, DATE_TRUNC('month', ss.sold_at)::date AS month, ss.real_price_snapshot AS base_amount
-           FROM session_sim_sales ss JOIN cashier_sessions cs ON cs.id = ss.session_id
-          WHERE ss.is_voided = FALSE AND cs.session_date BETWEEN $1 AND $2
-       )
-       SELECT cashier_id, month, SUM(base_amount) AS base_amount FROM combined GROUP BY cashier_id, month`,
-      [from, to]
-    ),
-    manualRechargesByMonth(from, to),
-  ]);
-
   const totals = sessions.reduce((acc, s) => {
     acc.sim_units += parseInt(s.sim_units_sold, 10) || 0; acc.sim_revenue += parseFloat(s.sim_total_selling_price) || 0; acc.sim_cost += parseFloat(s.sim_total_real_price) || 0;
     acc.sim_points += parseInt(s.sim_total_points, 10) || 0;
@@ -792,38 +727,14 @@ const getCashierHistory = asyncHandler(async (req, res) => {
   
   totals.loyalty_discount_dzd = totals.loyalty_points_redeemed * ptVal;
 
-  // This cashier's share of the manual recharges (proportional to their part of the Prélèvement base).
-  const myBaseByMonth = new Map();
-  const allBaseByMonth = new Map();
-  for (const r of prelevementMonths) {
-    const k = monthKey(r.month);
-    const b = parseFloat(r.base_amount) || 0;
-    allBaseByMonth.set(k, (allBaseByMonth.get(k) || 0) + b);
-    if (r.cashier_id === cashierId) myBaseByMonth.set(k, (myBaseByMonth.get(k) || 0) + b);
-  }
-  const myBase  = Array.from(myBaseByMonth.values()).reduce((s, b) => s + b, 0);
-  const allBase = Array.from(allBaseByMonth.values()).reduce((s, b) => s + b, 0);
-
-  let total_prelevement = 0;
-  const base_total = totals.storm_revenue + totals.sim_cost;
-  if (rangeDays === 1) {
-    const manualShare = allBase > 0 ? manualRecharges.total * (myBase / allBase) : 0;
-    total_prelevement = (base_total + manualShare) * 0.025;
-  } else {
-    for (const [k, mine] of myBaseByMonth) {
-      const whole = allBaseByMonth.get(k) || 0;
-      const manualMonth = manualRecharges.byMonth.get(k) || 0;
-      const manualShare = whole > 0 ? manualMonth * (mine / whole) : 0;
-      total_prelevement += calculatePrelevement(mine + manualShare);
-    }
-  }
-
-  // PURE GROSS PROFIT MATH
-  const final_gross_profit = (totals.sim_revenue - totals.sim_cost + totals.sim_points) + (totals.accessories_revenue - totals.accessories_cost) + total_prelevement;
+  // PROFIT = SIM profit + product profit (Prélèvement is global, not per cashier)
+  const sim_profit = totals.sim_revenue - totals.sim_cost + totals.sim_points;
+  const accessories_profit = totals.accessories_revenue - totals.accessories_cost;
+  const final_gross_profit = sim_profit + accessories_profit;
 
   sendSuccess(res, {
     cashier, from, to,
-    totals: { ...totals, prelevement: total_prelevement, gross_profit: final_gross_profit, total_revenue: totals.sim_revenue + totals.storm_revenue + totals.accessories_revenue },
+    totals: { ...totals, sim_profit, accessories_profit, gross_profit: final_gross_profit, total_revenue: totals.sim_revenue + totals.storm_revenue + totals.accessories_revenue },
     sessions, monthly, voided_transactions: voids, voided_count: voids.length, outstanding_advance_balance: parseFloat(advRows[0]?.outstanding_balance) || 0,
   });
 });
@@ -853,8 +764,364 @@ const getAuditLog = asyncHandler(async (req, res) => {
   sendSuccess(res, { items: rows, total: countRows[0]?.total ?? 0, limit, offset });
 });
 
+// ═════════════════════════════════════════════════════════════════════════════
+// SALES AGGREGATION HELPERS (shared by the cashier ranking and the statistics)
+// PROFIT RULE (everywhere): profit = SIM profit + product profit
+//   SIM profit     = selling price - real price + commission points
+//   product profit = price - real price
+// ═════════════════════════════════════════════════════════════════════════════
+
+const num = (v) => parseFloat(v) || 0;
+
+const addDays = (dateStr, n) => {
+  const d = new Date(`${dateStr}T00:00:00Z`);
+  d.setUTCDate(d.getUTCDate() + n);
+  return d.toISOString().slice(0, 10);
+};
+
+const pctChange = (cur, prev) => (prev > 0 ? ((cur - prev) / prev) * 100 : null);
+
+const SALES_SOURCES = {
+  sim: {
+    from: 'session_sim_sales s', ts: 's.sold_at',
+    select: `COUNT(*)::int AS units,
+             COALESCE(SUM(s.selling_price_snapshot), 0) AS revenue,
+             COALESCE(SUM(s.real_price_snapshot), 0) AS cost,
+             COALESCE(SUM(s.commission_points_snapshot), 0) AS points,
+             COALESCE(SUM(s.commission_snapshot), 0) AS commission,
+             COALESCE(SUM(s.selling_price_snapshot - s.real_price_snapshot + s.commission_points_snapshot), 0) AS profit,
+             COUNT(*) FILTER (WHERE s.my_ooredoo_app_installed)::int AS app_installs,
+             COALESCE(SUM(s.app_commission_snapshot) FILTER (WHERE s.my_ooredoo_app_installed), 0) AS app_commission`,
+  },
+  storm: {
+    from: 'session_storm_entries s', ts: 's.entered_at',
+    select: `COUNT(*)::int AS units, COALESCE(SUM(s.amount), 0) AS revenue`,
+  },
+  product: {
+    from: 'session_accessory_sales s', ts: 's.sold_at',
+    select: `COUNT(*)::int AS units,
+             COALESCE(SUM(s.price_snapshot), 0) AS revenue,
+             COALESCE(SUM(s.real_price_snapshot), 0) AS cost,
+             COALESCE(SUM(s.commission_snapshot), 0) AS commission,
+             COALESCE(SUM(s.price_snapshot - s.real_price_snapshot), 0) AS profit`,
+  },
+};
+
+/** groupBy: null | 'day' | 'store' | 'cashier'. Returns { sim: rows, storm: rows, product: rows }. */
+const loadSales = async (from, to, { storeId = null, groupBy = null } = {}) => {
+  const groupExprs = {
+    day: (src) => `to_char(${src.ts}::date, 'YYYY-MM-DD')`,
+    store: () => 'cs.store_id',
+    cashier: () => 'cs.cashier_id',
+  };
+  const out = {};
+  await Promise.all(Object.entries(SALES_SOURCES).map(async ([key, src]) => {
+    const g = groupBy ? groupExprs[groupBy](src) : null;
+    const { rows } = await db.query(
+      `SELECT ${g ? `${g} AS grp,` : ''} ${src.select}
+         FROM ${src.from} JOIN cashier_sessions cs ON cs.id = s.session_id
+        WHERE s.is_voided = FALSE AND ${src.ts}::date BETWEEN $1 AND $2
+          AND ($3::int IS NULL OR cs.store_id = $3)
+        ${g ? 'GROUP BY 1' : ''}`,
+      [from, to, storeId]
+    );
+    out[key] = rows;
+  }));
+  return out;
+};
+
+const indexByGroup = (rows) => new Map(rows.map((r) => [String(r.grp), r]));
+
+const buildMetrics = (sim = {}, storm = {}, prod = {}) => {
+  const simProfit = num(sim.profit);
+  const productProfit = num(prod.profit);
+  const totalRevenue = num(sim.revenue) + num(storm.revenue) + num(prod.revenue);
+  const grossProfit = simProfit + productProfit;
+  return {
+    sim: { units: num(sim.units), revenue: num(sim.revenue), cost: num(sim.cost), points: num(sim.points), commission: num(sim.commission), profit: simProfit },
+    product: { units: num(prod.units), revenue: num(prod.revenue), cost: num(prod.cost), commission: num(prod.commission), profit: productProfit },
+    storm: { entries: num(storm.units), amount: num(storm.revenue) },
+    app_installation: { count: num(sim.app_installs), commission: num(sim.app_commission) },
+    total_revenue: totalRevenue,
+    gross_profit: grossProfit,
+    margin_pct: totalRevenue > 0 ? (grossProfit / totalRevenue) * 100 : 0,
+  };
+};
+
+// ═════════════════════════════════════════════════════════════════════════════
+// CASHIER RANKING — sort cashiers by their work: product | sim | storm | app_installation
+// ═════════════════════════════════════════════════════════════════════════════
+
+// Which flat field each (work type, metric) sorts on.
+const RANKING_KEYS = {
+  product:          { count: 'product_units', amount: 'product_revenue', profit: 'product_profit' },
+  sim:              { count: 'sim_units',     amount: 'sim_revenue',     profit: 'sim_profit' },
+  storm:            { count: 'storm_entries', amount: 'storm_amount',    profit: 'storm_amount' },     // storm has no cost -> amount
+  app_installation: { count: 'app_installs',  amount: 'app_commission',  profit: 'app_commission' },
+};
+const DEFAULT_METRIC = { product: 'count', sim: 'count', storm: 'amount', app_installation: 'count' };
+
+// Standard competition ranking (1,2,2,4): ties share the same rank.
+const rankMap = (list, key) => {
+  const sorted = [...list].sort((a, b) => b[key] - a[key]);
+  const ranks = new Map();
+  sorted.forEach((c, i) => ranks.set(c.cashier_id, i > 0 && sorted[i - 1][key] === c[key] ? ranks.get(sorted[i - 1].cashier_id) : i + 1));
+  return ranks;
+};
+
+/**
+ * Pure function: sorts cashiers by the chosen kind of work.
+ *   by     : 'product' | 'sim' | 'storm' | 'app_installation'
+ *   metric : 'count' | 'amount' | 'profit'   (default depends on `by`)
+ *   order  : 'desc' (best first, default) | 'asc'
+ * Ties are broken by total gross profit, then by name. Each item gets `rank` (for the chosen sort)
+ * and `ranks` (its rank in each of the 4 work types, on their default metric).
+ */
+const sortCashiers = (cashiers, by = 'sim', metric, order = 'desc') => {
+  if (!RANKING_KEYS[by]) throw AppError.badRequest(`"by" must be one of: ${Object.keys(RANKING_KEYS).join(', ')}.`, 'INVALID_SORT');
+  const m = metric || DEFAULT_METRIC[by];
+  if (!RANKING_KEYS[by][m]) throw AppError.badRequest('"metric" must be one of: count, amount, profit.', 'INVALID_METRIC');
+  if (!['asc', 'desc'].includes(order)) throw AppError.badRequest('"order" must be asc or desc.', 'INVALID_ORDER');
+
+  const key = RANKING_KEYS[by][m];
+  const dir = order === 'asc' ? 1 : -1;
+  const perType = {};
+  for (const t of Object.keys(RANKING_KEYS)) perType[t] = rankMap(cashiers, RANKING_KEYS[t][DEFAULT_METRIC[t]]);
+  const chosenRanks = rankMap(cashiers, key);
+
+  return [...cashiers]
+    .sort((a, b) => dir * (a[key] - b[key]) || b.gross_profit - a.gross_profit || String(a.cashier_full_name).localeCompare(String(b.cashier_full_name)))
+    .map((c) => ({
+      ...c,
+      rank: chosenRanks.get(c.cashier_id), // 1 = best, regardless of display order
+      ranks: Object.fromEntries(Object.keys(RANKING_KEYS).map((t) => [t, perType[t].get(c.cashier_id)])),
+      sorted_by: { by, metric: m, value: c[key] },
+    }));
+};
+
+const loadCashierMetrics = async (from, to, storeId = null) => {
+  const [sales, { rows: users }] = await Promise.all([
+    loadSales(from, to, { storeId, groupBy: 'cashier' }),
+    db.query(
+      `SELECT u.id, u.full_name, u.store_id, u.is_active, st.name AS store_name
+         FROM users u LEFT JOIN stores st ON st.id = u.store_id WHERE u.role = 'cashier'`
+    ),
+  ]);
+  const sim = indexByGroup(sales.sim), storm = indexByGroup(sales.storm), prod = indexByGroup(sales.product);
+
+  return users
+    .map((u) => {
+      const id = String(u.id);
+      const hasActivity = sim.has(id) || storm.has(id) || prod.has(id);
+      const m = buildMetrics(sim.get(id), storm.get(id), prod.get(id));
+      return {
+        _keep: hasActivity || (u.is_active && (!storeId || u.store_id === storeId)),
+        cashier_id: u.id, cashier_full_name: u.full_name, store_id: u.store_id, store_name: u.store_name, is_active: u.is_active,
+        product_units: m.product.units, product_revenue: m.product.revenue, product_profit: m.product.profit,
+        sim_units: m.sim.units, sim_revenue: m.sim.revenue, sim_profit: m.sim.profit,
+        storm_entries: m.storm.entries, storm_amount: m.storm.amount,
+        app_installs: m.app_installation.count, app_commission: m.app_installation.commission,
+        total_revenue: m.total_revenue,
+        gross_profit: m.gross_profit, // = sim profit + product profit
+      };
+    })
+    .filter((c) => c._keep)
+    .map(({ _keep, ...c }) => c);
+};
+
+// ─── GET /api/reports/cashiers/ranking?by=sim&metric=count&order=desc&from&to&store_id&limit ─────
+const getCashierRanking = asyncHandler(async (req, res) => {
+  const today = todayStr();
+  const from = req.query.from ? parseDate(req.query.from, 'from') : `${today.slice(0, 7)}-01`;
+  const to   = req.query.to   ? parseDate(req.query.to,   'to')   : today;
+  if (from > to) throw AppError.badRequest('"to" must be on or after "from".', 'INVALID_DATE_RANGE');
+  const storeId = req.query.store_id ? parseId(req.query.store_id, 'store_id') : null;
+  const limit = req.query.limit ? Math.min(Math.max(parseInt(req.query.limit, 10) || 1, 1), 500) : null;
+
+  const by = String(req.query.by || 'sim').toLowerCase();
+  const order = String(req.query.order || 'desc').toLowerCase();
+  const metric = req.query.metric ? String(req.query.metric).toLowerCase() : undefined;
+
+  const cashiers = await loadCashierMetrics(from, to, storeId);
+  let items = sortCashiers(cashiers, by, metric, order);
+  if (limit) items = items.slice(0, limit);
+
+  sendSuccess(res, { from, to, store_id: storeId, by, metric: metric || DEFAULT_METRIC[by], order, count: items.length, items });
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// STATISTICS — sales, cashiers, expenses, advances, profit
+// GET /api/reports/stats?from&to&store_id
+// ═════════════════════════════════════════════════════════════════════════════
+
+const getStatistics = asyncHandler(async (req, res) => {
+  const today = todayStr();
+  const from = req.query.from ? parseDate(req.query.from, 'from') : `${today.slice(0, 7)}-01`;
+  const to   = req.query.to   ? parseDate(req.query.to,   'to')   : today;
+  if (from > to) throw AppError.badRequest('"to" must be on or after "from".', 'INVALID_DATE_RANGE');
+  const storeId = req.query.store_id ? parseId(req.query.store_id, 'store_id') : null;
+
+  // Previous period of the same length, right before `from`.
+  const days = daysBetween(from, to);
+  const prevTo = addDays(from, -1);
+  const prevFrom = addDays(from, -days);
+
+  const [
+    current, previous, byDay, byStore, cashiers, { rows: storeRows },
+    { rows: expenseRows }, { rows: advanceRows }, { rows: outstandingRows }, { rows: debtRows }, prelevementInfo,
+  ] = await Promise.all([
+    loadSales(from, to, { storeId }),
+    loadSales(prevFrom, prevTo, { storeId }),
+    loadSales(from, to, { storeId, groupBy: 'day' }),
+    loadSales(from, to, { storeId, groupBy: 'store' }),
+    loadCashierMetrics(from, to, storeId),
+    db.query(`SELECT id, name FROM stores`),
+    db.query(
+      `SELECT re.store_id, re.category,
+              COALESCE(SUM(re.amount) FILTER (WHERE COALESCE(re.description, '') NOT LIKE $4), 0) AS amt,
+              COALESCE(SUM(re.amount) FILTER (WHERE COALESCE(re.description, '') LIKE $4), 0)     AS swept
+         FROM register_expenses re
+        WHERE re.is_voided = FALSE AND re.expense_date BETWEEN $1 AND $2 AND ($3::int IS NULL OR re.store_id = $3)
+        GROUP BY re.store_id, re.category`,
+      [from, to, storeId, SWEEP_DESC_PREFIX]
+    ),
+    db.query(
+      `SELECT ca.cashier_id, u.full_name,
+              COALESCE(SUM(ca.amount) FILTER (WHERE ca.direction = 'advance'), 0)   AS advanced,
+              COALESCE(SUM(ca.amount) FILTER (WHERE ca.direction = 'repayment'), 0) AS repaid
+         FROM cashier_advances ca JOIN users u ON u.id = ca.cashier_id
+        WHERE ca.is_voided = FALSE AND ca.created_at::date BETWEEN $1 AND $2 AND ($3::int IS NULL OR u.store_id = $3)
+        GROUP BY ca.cashier_id, u.full_name`,
+      [from, to, storeId]
+    ),
+    db.query(
+      `SELECT ca.cashier_id, u.full_name,
+              SUM(CASE WHEN ca.direction = 'advance' THEN ca.amount ELSE -ca.amount END) AS outstanding
+         FROM cashier_advances ca JOIN users u ON u.id = ca.cashier_id
+        WHERE ca.is_voided = FALSE AND ($1::int IS NULL OR u.store_id = $1)
+        GROUP BY ca.cashier_id, u.full_name
+       HAVING SUM(CASE WHEN ca.direction = 'advance' THEN ca.amount ELSE -ca.amount END) > 0
+        ORDER BY outstanding DESC`,
+      [storeId]
+    ),
+    db.query(
+      `SELECT COALESCE(SUM(sd.amount), 0) AS total, COUNT(*)::int AS count
+         FROM session_debts sd JOIN cashier_sessions cs ON cs.id = sd.session_id
+        WHERE sd.is_voided = FALSE AND sd.entered_at::date BETWEEN $1 AND $2 AND ($3::int IS NULL OR cs.store_id = $3)`,
+      [from, to, storeId]
+    ),
+    // Prélèvement: global (manual recharges of the Side-Ledger), only meaningful without a store filter
+    storeId ? Promise.resolve({ manual_recharges: 0, prelevement: 0, by_month: [] }) : getPrelevementForRange(from, to),
+  ]);
+
+  const storeName = new Map(storeRows.map((s) => [s.id, s.name]));
+
+  // ── Sales & profit ─────────────────────────────────────────────────────────
+  const cur = buildMetrics(current.sim[0], current.storm[0], current.product[0]);
+  const prev = buildMetrics(previous.sim[0], previous.storm[0], previous.product[0]);
+
+  // ── Expenses (the nightly cash sweep is NOT an expense) ───────────────────
+  const expenses = { total: 0, by_category: { utility: 0, inventory: 0, other: 0 }, by_store: new Map() };
+  let cashCollected = 0;
+  for (const e of expenseRows) {
+    const amt = num(e.amt);
+    expenses.total += amt;
+    expenses.by_category[e.category] = (expenses.by_category[e.category] || 0) + amt;
+    expenses.by_store.set(e.store_id, (expenses.by_store.get(e.store_id) || 0) + amt);
+    cashCollected += num(e.swept);
+  }
+
+  // ── Advances ───────────────────────────────────────────────────────────────
+  const advanced = advanceRows.reduce((s, a) => s + num(a.advanced), 0);
+  const repaid = advanceRows.reduce((s, a) => s + num(a.repaid), 0);
+
+  // ── Profit: SIM profit + product profit (+ Prélèvement, - expenses for the net figure) ──
+  const netProfit = cur.gross_profit + prelevementInfo.prelevement - expenses.total;
+
+  // ── Daily series ───────────────────────────────────────────────────────────
+  const simD = indexByGroup(byDay.sim), stormD = indexByGroup(byDay.storm), prodD = indexByGroup(byDay.product);
+  const allDays = Array.from(new Set([...simD.keys(), ...stormD.keys(), ...prodD.keys()])).sort();
+  const daily = allDays.map((d) => {
+    const m = buildMetrics(simD.get(d), stormD.get(d), prodD.get(d));
+    return { date: d, sim_revenue: m.sim.revenue, sim_profit: m.sim.profit, product_revenue: m.product.revenue, product_profit: m.product.profit, storm_amount: m.storm.amount, total_revenue: m.total_revenue, gross_profit: m.gross_profit };
+  });
+
+  // ── Per store ──────────────────────────────────────────────────────────────
+  const simS = indexByGroup(byStore.sim), stormS = indexByGroup(byStore.storm), prodS = indexByGroup(byStore.product);
+  const storeIds = new Set([...simS.keys(), ...stormS.keys(), ...prodS.keys(), ...Array.from(expenses.by_store.keys()).map(String)]);
+  const per_store = Array.from(storeIds).map((sid) => {
+    const m = buildMetrics(simS.get(sid), stormS.get(sid), prodS.get(sid));
+    const exp = expenses.by_store.get(Number(sid)) || 0;
+    return { store_id: Number(sid), store_name: storeName.get(Number(sid)) || null, ...m, expenses: exp, profit_after_expenses: m.gross_profit - exp };
+  }).sort((a, b) => b.gross_profit - a.gross_profit);
+
+  // ── Cashiers ───────────────────────────────────────────────────────────────
+  const leader = (by) => { const [top] = sortCashiers(cashiers, by); return top && top.sorted_by.value > 0 ? { cashier_id: top.cashier_id, cashier_full_name: top.cashier_full_name, value: top.sorted_by.value } : null; };
+  const byProfit = [...cashiers].sort((a, b) => b.gross_profit - a.gross_profit);
+
+  sendSuccess(res, {
+    from, to, store_id: storeId, days,
+
+    sales: {
+      total_revenue: cur.total_revenue,
+      sim: cur.sim,
+      product: cur.product,
+      storm: cur.storm,
+      app_installation: cur.app_installation,
+      units_sold: cur.sim.units + cur.product.units,
+    },
+
+    profit: {
+      rule: 'gross_profit = sim_profit + product_profit',
+      sim_profit: cur.sim.profit,
+      product_profit: cur.product.profit,
+      gross_profit: cur.gross_profit,
+      margin_pct: cur.margin_pct,
+      manual_recharges: prelevementInfo.manual_recharges,
+      prelevement: prelevementInfo.prelevement,
+      prelevement_included: !storeId,
+      expenses: expenses.total,
+      net_profit: netProfit, // gross_profit + prelevement - expenses
+    },
+
+    previous_period: {
+      from: prevFrom, to: prevTo,
+      total_revenue: prev.total_revenue, gross_profit: prev.gross_profit,
+      change_pct: { total_revenue: pctChange(cur.total_revenue, prev.total_revenue), gross_profit: pctChange(cur.gross_profit, prev.gross_profit) },
+    },
+
+    daily,
+    per_store,
+
+    cashiers: {
+      active_count: cashiers.filter((c) => c.is_active).length,
+      with_sales_count: cashiers.filter((c) => c.total_revenue > 0).length,
+      top: { sim: leader('sim'), product: leader('product'), storm: leader('storm'), app_installation: leader('app_installation') },
+      top_by_profit: byProfit.slice(0, 5).map((c) => ({ cashier_id: c.cashier_id, cashier_full_name: c.cashier_full_name, store_name: c.store_name, total_revenue: c.total_revenue, gross_profit: c.gross_profit })),
+    },
+
+    expenses: {
+      total: expenses.total,
+      by_category: expenses.by_category,
+      by_store: Array.from(expenses.by_store, ([sid, amount]) => ({ store_id: sid, store_name: storeName.get(sid) || null, amount })),
+      cash_collected_not_counted: cashCollected,
+    },
+
+    advances: {
+      advanced, repaid, net_period: advanced - repaid,
+      outstanding_total: outstandingRows.reduce((s, r) => s + num(r.outstanding), 0),
+      outstanding_by_cashier: outstandingRows.map((r) => ({ cashier_id: r.cashier_id, cashier_full_name: r.full_name, outstanding: num(r.outstanding) })),
+    },
+
+    debts: { total: num(debtRows[0]?.total), count: debtRows[0]?.count || 0 },
+
+    prelevement_by_month: prelevementInfo.by_month,
+  });
+});
+
 module.exports = {
   generateDailyReport, previewDailyReport, getReports, getReportById,
   getDateRangeReport, exportReportCsv, getMonthlySummary, getTopRollup,
   getCashierHistory, getAuditLog,
+  getCashierRanking, getStatistics, sortCashiers,
 };

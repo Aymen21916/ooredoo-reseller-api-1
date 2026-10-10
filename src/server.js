@@ -31,14 +31,15 @@ const discountRoutes = require('./routes/discountRoutes');
 const registerLedgerRoutes = require('./routes/registerLedgerRoutes');
 const customerValidationRoutes = require('./routes/customerValidationRoutes');
 const cardPaymentsRoutes = require('./routes/cardPaymentsRoutes');
-// const { set } = require('fast-check');
 
 const app = express();
+// Filter(Boolean): an unset CORS_ORIGIN used to leave `undefined` in the list.
+// CORS_ORIGIN may hold several origins separated by commas.
 const allowedOrigins = [
   'http://localhost:5173',
-  'http://localhost:5174',  
-  process.env.CORS_ORIGIN 
-];
+  'http://localhost:5174',
+  ...(process.env.CORS_ORIGIN || '').split(',').map((o) => o.trim()),
+].filter(Boolean);
 
 // ─── Trust Proxy (required behind Nginx/load balancer for correct IP) ────────
 app.set('trust proxy', 1);
@@ -118,12 +119,16 @@ app.use('/api/customer-validation', customerValidationRoutes);
 app.use('/api/card-payments', cardPaymentsRoutes);
 
 // ─── 404 & Global Error Handling ─────────────────────────────────────────────
+// Sentry's Express error handler must come after the routes and before our own error handler.
+if (Sentry && typeof Sentry.setupExpressErrorHandler === 'function') {
+  Sentry.setupExpressErrorHandler(app);
+}
 app.use(notFoundHandler);
 app.use(errorHandler);
 
 // ─── Refresh Token Cleanup (runs every 6 hours) ─────────────────────────────
 const CLEANUP_INTERVAL_MS = 6 * 60 * 60 * 1000;
-setInterval(async () => {
+const cleanupTimer = setInterval(async () => {
   try {
     const { rowCount } = await pool.query(
       `DELETE FROM refresh_tokens WHERE expires_at < NOW() - INTERVAL '7 days'`
@@ -135,6 +140,16 @@ setInterval(async () => {
     logger.error({ err }, 'Refresh token cleanup failed.');
   }
 }, CLEANUP_INTERVAL_MS);
+cleanupTimer.unref(); // never keep the process alive just for this timer
+
+// ─── Last-resort process handlers ────────────────────────────────────────────
+process.on('unhandledRejection', (reason) => {
+  logger.error({ err: reason }, '[PROCESS] Unhandled promise rejection.');
+});
+process.on('uncaughtException', (err) => {
+  logger.fatal({ err }, '[PROCESS] Uncaught exception. Exiting.');
+  process.exit(1);
+});
 
 // ─── Server Initialization with DB Retry ─────────────────────────────────────
 const startServer = async (retries = 5) => {
@@ -171,11 +186,14 @@ const startServer = async (retries = 5) => {
     setTimeout(() => {
       logger.error('[SERVER] Forced shutdown after timeout.');
       process.exit(1);
-    }, 10_000);
+    }, 10_000).unref();
   };
 
   process.on('SIGTERM', () => shutdown('SIGTERM'));
   process.on('SIGINT', () => shutdown('SIGINT'));
 };
 
-startServer();
+startServer().catch((err) => {
+  logger.fatal({ err }, '[SERVER] Startup failed.');
+  process.exit(1);
+});

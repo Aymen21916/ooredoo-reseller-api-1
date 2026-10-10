@@ -6,7 +6,7 @@ const { asyncHandler, sendSuccess } = require('../utils/asyncHandler');
 const { audit } = require('../utils/audit');
 const cron = require('node-cron');
 const { requireFields, parseId, parseString, validateDateRange } = require('../utils/validators');
-const { MANUAL_ITEMS_SQL } = require('../utils/manualLedger');
+const { fetchManualLedger } = require('../utils/prelevement');
 
 const { callOoredooApi } = require('../services/ooredooService');
 
@@ -17,7 +17,7 @@ const internalSyncPool = async (userId, notes) => {
   const initRes = initReq.data;
   if (initRes.code !== 0) throw new Error('Failed to initiate *BalancePDV.');
   
-  const pinReq = await callOoredooApi({ app_id: "ussd_app", service_code: "", msg: "0000", session_id: initRes.data.nb_session_id.toString(), session_continue: "1", cache_enable: false });
+  const pinReq = await callOoredooApi({ app_id: "ussd_app", service_code: "", msg: process.env.OOREDOO_PDV_PIN || "0000", session_id: initRes.data.nb_session_id.toString(), session_continue: "1", cache_enable: false });
   const pinRes = pinReq.data;
   if (pinRes.code !== 0) throw new Error('Failed to retrieve balances with PIN.');
 
@@ -45,19 +45,23 @@ cron.schedule('0 6 * * *', async () => {
   
   let snapshotSuccess = false;
   let attempt = 1;
+  const MAX_SNAPSHOT_ATTEMPTS = 10; // ~20 min; never block the cash sweep below forever
 
-  while (!snapshotSuccess) {
+  while (!snapshotSuccess && attempt <= MAX_SNAPSHOT_ATTEMPTS) {
     try {
       await internalSyncPool(1, '[SNAPSHOT] Daily Opening Balance');
       console.log(`[CRON] Ooredoo snapshot saved successfully on attempt ${attempt}.`);
       snapshotSuccess = true;
     } catch (err) {
       console.error(`[CRON ERROR] Ooredoo snapshot failed on attempt ${attempt}:`, err.message);
-      console.log('[CRON] Waiting 2 minutes before retrying...');
       attempt++;
-      await delay(2 * 60 * 1000); 
+      if (attempt <= MAX_SNAPSHOT_ATTEMPTS) {
+        console.log('[CRON] Waiting 2 minutes before retrying...');
+        await delay(2 * 60 * 1000);
+      }
     }
   }
+  if (!snapshotSuccess) console.error(`[CRON ERROR] Ooredoo snapshot gave up after ${MAX_SNAPSHOT_ATTEMPTS} attempts. Continuing with the register sweep.`);
 
   try {
     const { rows: stores } = await db.query(`SELECT id, name FROM stores WHERE is_active = TRUE`);
@@ -171,82 +175,78 @@ const updatePool = asyncHandler(async (req, res) => {
 });
 
 const getDailyReconciliation = asyncHandler(async (req, res) => {
-  try {
-    const logicalStart = new Date();
-    if (logicalStart.getHours() < 6) logicalStart.setDate(logicalStart.getDate() - 1);
-    logicalStart.setHours(6, 0, 0, 0);
+  const logicalStart = new Date();
+  if (logicalStart.getHours() < 6) logicalStart.setDate(logicalStart.getDate() - 1);
+  logicalStart.setHours(6, 0, 0, 0);
 
-    const { rows: historyDesc } = await db.query(`SELECT * FROM global_pool_state ORDER BY id DESC LIMIT 500`);
-    const historyAsc = historyDesc.reverse();
+  const { rows: historyDesc } = await db.query(`SELECT * FROM global_pool_state ORDER BY id DESC LIMIT 500`);
+  const historyAsc = historyDesc.reverse();
 
-    let openingState = historyAsc.find(h => {
-      if (!h.notes) return false;
-      const isSnap = h.notes.includes('[SNAPSHOT]');
-      const ts = new Date(h.created_at || h.updated_at || new Date());
-      return isSnap && ts >= logicalStart;
-    });
-    
-    if (!openingState) {
-        openingState = historyAsc.find(h => {
-            const ts = new Date(h.created_at || h.updated_at || new Date());
-            return ts >= logicalStart;
-        });
-    }
-
-    if (!openingState) {
-        openingState = { available_balance: 0, available_bonus: 0, available_points: 0 };
-    }
-
-    const openingTotal = (parseFloat(openingState.available_balance) || 0) + (parseFloat(openingState.available_bonus) || 0);
-    const openingPoints = parseFloat(openingState.available_points) || 0;
-
-    const [{ rows: simRows }, { rows: stormRows }] = await Promise.all([
-      db.query(`SELECT COALESCE(SUM(commission_points_snapshot), 0) AS total_points, COALESCE(SUM(real_price_snapshot), 0) AS total_cost 
-                FROM session_sim_sales WHERE sold_at >= $1 AND is_voided = FALSE`, [logicalStart]).catch((err) => { console.error(err); return {rows:[{}]} }),
-      db.query(`SELECT COALESCE(SUM(amount), 0) AS total_amount 
-                FROM session_storm_entries WHERE entered_at >= $1 AND is_voided = FALSE`, [logicalStart]).catch((err) => { console.error(err); return {rows:[{}]} })
-    ]);
-    
-    const simPoints = parseFloat(simRows[0]?.total_points || 0) || 0;
-    const simCost = parseFloat(simRows[0]?.total_cost || 0) || 0;
-    const stormAmount = parseFloat(stormRows[0]?.total_amount || 0) || 0;
-
-    let manualRecharges = 0, manualRewards = 0, pointsConverted = 0, dzdConverted = 0;
-
-    historyAsc.forEach(h => {
-      if (!h.notes) return;
-      const ts = new Date(h.created_at || h.updated_at || new Date());
-      if (ts < logicalStart) return;
-
-      const convMatch = h.notes.match(/\[CONVERSION\] Converted ([\d.]+) pts into ([\d.]+) DZD/);
-      if (convMatch) { pointsConverted += parseFloat(convMatch[1]) || 0; dzdConverted += parseFloat(convMatch[2]) || 0; }
-      
-      // FIX: Regex unlocked to safely read negative numbers `[-]?`
-      const rechMatch = h.notes.match(/\[RECHARGE\] ([-]?[\d.]+)/);
-      if (rechMatch) manualRecharges += parseFloat(rechMatch[1]) || 0;
-      const rewMatch = h.notes.match(/\[REWARD\] ([-]?[\d.]+)/);
-      if (rewMatch) manualRewards += parseFloat(rewMatch[1]) || 0;
-    });
-
-    const current = historyAsc.length > 0 ? historyAsc[historyAsc.length - 1] : { available_balance: 0, available_bonus: 0, available_points: 0 };
-    const actualTotal = (parseFloat(current.available_balance) || 0) + (parseFloat(current.available_bonus) || 0);
-    const actualPoints = parseFloat(current.available_points) || 0;
-
-    const expectedPoints = openingPoints + simPoints + manualRewards - pointsConverted;
-    const expectedTotal = openingTotal + manualRecharges + dzdConverted - simCost - stormAmount;
-
-    sendSuccess(res, {
-      timeline: { start: logicalStart.toISOString() },
-      opening: { solde_total: openingTotal, points: openingPoints },
-      activity: { sim_points_earned: simPoints, sim_buying_cost: simCost, storm_sold: stormAmount, manual_recharges: manualRecharges, manual_rewards: manualRewards, points_converted: pointsConverted, dzd_converted: dzdConverted },
-      audit: {
-        points: { expected: expectedPoints, actual: actualPoints, discrepancy: actualPoints - expectedPoints },
-        balance: { expected: expectedTotal, actual: actualTotal, discrepancy: actualTotal - expectedTotal }
-      }
-    });
-  } catch (error) {
-    res.status(500).json({ success: false, message: `Reconciliation Crash: ${error.message}` });
+  let openingState = historyAsc.find(h => {
+    if (!h.notes) return false;
+    const isSnap = h.notes.includes('[SNAPSHOT]');
+    const ts = new Date(h.created_at || h.updated_at || new Date());
+    return isSnap && ts >= logicalStart;
+  });
+  
+  if (!openingState) {
+      openingState = historyAsc.find(h => {
+          const ts = new Date(h.created_at || h.updated_at || new Date());
+          return ts >= logicalStart;
+      });
   }
+
+  if (!openingState) {
+      openingState = { available_balance: 0, available_bonus: 0, available_points: 0 };
+  }
+
+  const openingTotal = (parseFloat(openingState.available_balance) || 0) + (parseFloat(openingState.available_bonus) || 0);
+  const openingPoints = parseFloat(openingState.available_points) || 0;
+
+  const [{ rows: simRows }, { rows: stormRows }] = await Promise.all([
+    db.query(`SELECT COALESCE(SUM(commission_points_snapshot), 0) AS total_points, COALESCE(SUM(real_price_snapshot), 0) AS total_cost 
+              FROM session_sim_sales WHERE sold_at >= $1 AND is_voided = FALSE`, [logicalStart]),
+    db.query(`SELECT COALESCE(SUM(amount), 0) AS total_amount 
+              FROM session_storm_entries WHERE entered_at >= $1 AND is_voided = FALSE`, [logicalStart])
+  ]);
+  
+  const simPoints = parseFloat(simRows[0]?.total_points || 0) || 0;
+  const simCost = parseFloat(simRows[0]?.total_cost || 0) || 0;
+  const stormAmount = parseFloat(stormRows[0]?.total_amount || 0) || 0;
+
+  let manualRecharges = 0, manualRewards = 0, pointsConverted = 0, dzdConverted = 0;
+
+  historyAsc.forEach(h => {
+    if (!h.notes) return;
+    const ts = new Date(h.created_at || h.updated_at || new Date());
+    if (ts < logicalStart) return;
+
+    const convMatch = h.notes.match(/\[CONVERSION\] Converted ([\d.]+) pts into ([\d.]+) DZD/);
+    if (convMatch) { pointsConverted += parseFloat(convMatch[1]) || 0; dzdConverted += parseFloat(convMatch[2]) || 0; }
+    
+    // FIX: Regex unlocked to safely read negative numbers `[-]?`
+    const rechMatch = h.notes.match(/\[RECHARGE\] ([-]?[\d.]+)/);
+    if (rechMatch) manualRecharges += parseFloat(rechMatch[1]) || 0;
+    const rewMatch = h.notes.match(/\[REWARD\] ([-]?[\d.]+)/);
+    if (rewMatch) manualRewards += parseFloat(rewMatch[1]) || 0;
+  });
+
+  const current = historyAsc.length > 0 ? historyAsc[historyAsc.length - 1] : { available_balance: 0, available_bonus: 0, available_points: 0 };
+  const actualTotal = (parseFloat(current.available_balance) || 0) + (parseFloat(current.available_bonus) || 0);
+  const actualPoints = parseFloat(current.available_points) || 0;
+
+  const expectedPoints = openingPoints + simPoints + manualRewards - pointsConverted;
+  const expectedTotal = openingTotal + manualRecharges + dzdConverted - simCost - stormAmount;
+
+  sendSuccess(res, {
+    timeline: { start: logicalStart.toISOString() },
+    opening: { solde_total: openingTotal, points: openingPoints },
+    activity: { sim_points_earned: simPoints, sim_buying_cost: simCost, storm_sold: stormAmount, manual_recharges: manualRecharges, manual_rewards: manualRewards, points_converted: pointsConverted, dzd_converted: dzdConverted },
+    audit: {
+      points: { expected: expectedPoints, actual: actualPoints, discrepancy: actualPoints - expectedPoints },
+      balance: { expected: expectedTotal, actual: actualTotal, discrepancy: actualTotal - expectedTotal }
+    }
+  });
 });
 
 const getRegisters = asyncHandler(async (req, res) => {
@@ -261,9 +261,11 @@ const getRegisters = asyncHandler(async (req, res) => {
 const updateRegister = asyncHandler(async (req, res) => {
   requireFields(req.body, ['amount', 'type']);
   const storeId = parseId(req.params.id, 'store_id');
-  const type = ['add', 'subtract'].includes(req.body.type) ? req.body.type : null;
+  if (!['add', 'subtract'].includes(req.body.type)) throw AppError.badRequest('type must be "add" or "subtract".', 'VALIDATION_ERROR');
+  const type = req.body.type;
   const amount = parseFloat(req.body.amount);
-  if (isNaN(amount)) throw AppError.badRequest('Invalid amount.');
+  // A negative amount would silently invert add/subtract and bypass the intent of `type`.
+  if (!Number.isFinite(amount) || amount <= 0) throw AppError.badRequest('Amount must be a positive number.', 'VALIDATION_ERROR');
   const note = req.body.note ? parseString(req.body.note, 'note', 500) : null;
   
   const applyAdjustment = (current, amount, type) => {
@@ -273,7 +275,8 @@ const updateRegister = asyncHandler(async (req, res) => {
   };
 
   const result = await db.withTransaction(async (client) => {
-    const { rows: r } = await client.query(`SELECT cash_amount FROM store_register_state WHERE store_id = $1 ORDER BY id DESC LIMIT 1`, [storeId]);
+    // FOR UPDATE: two concurrent adjustments must not read the same balance.
+    const { rows: r } = await client.query(`SELECT cash_amount FROM store_register_state WHERE store_id = $1 ORDER BY id DESC LIMIT 1 FOR UPDATE`, [storeId]);
     const current = r[0] ? parseFloat(r[0].cash_amount) : 0;
     const next = applyAdjustment(current, amount, type);
     const { rows } = await client.query(
@@ -290,33 +293,16 @@ const updateRegister = asyncHandler(async (req, res) => {
 const getManualLedger = asyncHandler(async (req, res) => {
   const { from, to } = validateDateRange(req.query.from, req.query.to);
 
-  const [{ rows: items }, { rows: sums }] = await Promise.all([
-    db.query(
-      `SELECT m.id, m.type, m.amount, m.note, m.created_at, u.full_name AS added_by
-         FROM (${MANUAL_ITEMS_SQL}) m
-         LEFT JOIN users u ON u.id = m.updated_by
-        WHERE m.created_at::date BETWEEN $1 AND $2
-        ORDER BY m.created_at DESC, m.id DESC
-        LIMIT 1000`,
-      [from, to]
-    ),
-    db.query(
-      `SELECT COALESCE(SUM(m.amount) FILTER (WHERE m.type = 'RECHARGE'), 0) AS recharges,
-              COALESCE(SUM(m.amount) FILTER (WHERE m.type = 'REWARD'), 0)   AS rewards,
-              COUNT(*)::int                                                 AS count
-         FROM (${MANUAL_ITEMS_SQL}) m
-        WHERE m.created_at::date BETWEEN $1 AND $2`,
-      [from, to]
-    ),
-  ]);
+  // Same query the Prélèvement uses (utils/prelevement.js) -> the figures can never diverge.
+  const { items, sums } = await fetchManualLedger(from, to);
 
-  const count = sums[0]?.count || 0;
+  const count = sums.count || 0;
   sendSuccess(res, {
     from,
     to,
     totals: {
-      recharges: parseFloat(sums[0]?.recharges) || 0,
-      rewards: parseFloat(sums[0]?.rewards) || 0,
+      recharges: parseFloat(sums.recharges) || 0,
+      rewards: parseFloat(sums.rewards) || 0,
       count,
     },
     truncated: count > items.length,

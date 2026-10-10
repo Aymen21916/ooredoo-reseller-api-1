@@ -20,6 +20,8 @@ router.post('/repayment', authorize('admin'), advancesController.createRepayment
 router.get('/', authorize('admin'), advancesController.getAllAdvances);
 router.get('/cashier/:id', authorize('admin'), advancesController.getCashierAdvances);
 router.get('/salary', authorize('admin'), advancesController.getPayroll);
+router.post('/salary/payments', authorize('admin'), advancesController.createSalaryPayment);
+router.post('/salary/payments/:id/void', authorize('admin'), advancesController.voidSalaryPayment);
 router.put('/salary/base', authorize('admin'), advancesController.setBaseSalary);
 router.patch('/salary/app-commission', authorize('admin'), advancesController.setAppCommissionEnabled);
 router.get('/settings', authorize('admin'), advancesController.getPayrollSettings);
@@ -28,7 +30,7 @@ router.put('/settings', authorize('admin'), advancesController.updatePayrollSett
 // ─── Cashier + admin endpoints (handlers branch on role internally) ──────────
 router.post('/', authorize('cashier', 'admin'), advancesController.createAdvance);
 router.get('/me', authorize('cashier', 'admin'), advancesController.getMyAdvances);
-// router.get('/salary/me', authorize('cashier'), advancesController.getMyPayroll);
+router.get('/salary/me', authorize('cashier'), advancesController.getMyPayroll);
 router.post('/:id/void', authorize('cashier', 'admin'), advancesController.voidAdvance);
 
 
